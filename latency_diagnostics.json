@@ -1,0 +1,27 @@
+{
+  "timestamp": "2026-02-05 22:59:01 UTC",
+  "environment": "PROD",
+  "authenticated_latency": {
+    "endpoint": "authenticated",
+    "samples": 20,
+    "errors": 0,
+    "min_ms": 213.9043000061065,
+    "max_ms": 875.3682000096887,
+    "mean_ms": 363.0826249951497,
+    "median_ms": 278.3600499969907,
+    "stdev_ms": 183.24878788317696,
+    "p95_ms": 875.3682000096887
+  },
+  "orderbook_latency": {
+    "endpoint": "orderbook",
+    "ticker": "KXNCAAMBGAME-26FEB07FRESNEV-NEV",
+    "samples": 20,
+    "errors": 0,
+    "min_ms": 210.3126000147313,
+    "max_ms": 626.4343000075314,
+    "mean_ms": 353.67536500270944,
+    "median_ms": 278.4206499927677,
+    "stdev_ms": 144.5503237800585,
+    "p95_ms": 626.4343000075314
+  }
+}
