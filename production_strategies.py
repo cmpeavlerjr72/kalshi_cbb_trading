@@ -1,32 +1,27 @@
-# production_multistrat.py
-# Production multi-strategy testing with all bug fixes
+# production_strategies.py
+# Updated Feb 6, 2026 — fixes from Feb 5 post-mortem
 #
-# Key improvements:
-# - Fixed SpreadCapture lock math
-# - Liquidity checks before all entries
-# - Proper fee rounding
-# - ESPN clock integration
-# - Position sizing based on capital
-# - Centralized execution
-# - Comprehensive logging
+# Changes from last night:
+#   P1: Model Edge circuit breakers (divergence, final-min lockout, re-entry cooldown, market-decided)
+#   P2: Mean Reversion adaptive threshold (dynamic σ, vol warmup, dead market detection)
+#   P3: Market quality pre-filter (skip illiquid/dead markets)
+#   P4: Settlement-aware P&L reporting
+#   P5: Fee management (fee-aware edge, lock attempt cap)
 
 import os
 import sys
 import time
-import json
 import math
-import threading
 import csv
+import json
+import threading
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, List, Optional, Tuple, Callable
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional, Tuple
 from collections import deque
 import datetime as dt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from dotenv import load_dotenv
-load_dotenv()
 
 from combo_vnext import (
     _load_private_key,
@@ -40,71 +35,125 @@ from combo_vnext import (
     place_limit_buy,
     place_limit_sell,
     wait_for_fill_or_timeout,
+    has_fill_liquidity_for_implied_buy,
     SERIES_TICKER,
+    MIN_LIQUIDITY_CONTRACTS,
 )
 
-from espn_game_clock import EspnGameClock
-
 # =============================================================================
-# CONFIGURATION
+# FEE CALCULATIONS (P5)
 # =============================================================================
 
-POLL_INTERVAL_SECS = 3.0
-STOP_TRADING_BEFORE_CLOSE_SECS = 300
-MIN_LIQUIDITY_CONTRACTS = 1
-
-# =============================================================================
-# FEE CALCULATIONS (WITH PROPER ROUNDING)
-# =============================================================================
-
-def calc_taker_fee_cents(price_cents: float, qty: int = 1) -> float:
-    """Kalshi taker fee: 0.07 × C × P × (1-P), max 2¢ per contract"""
-    price_cents = round(price_cents)  # FIXED: round instead of truncate
+def calc_taker_fee(price_cents: int, qty: int = 1) -> float:
+    """Kalshi taker fee in cents: 0.07 × P × (1−P), max 2¢ @ 50¢"""
     if price_cents <= 0 or price_cents >= 100:
         return 0.0
     p = price_cents / 100.0
     fee_per = min(0.07 * p * (1 - p), 0.02)
     return fee_per * qty * 100
 
-def calc_maker_fee_cents(price_cents: float, qty: int = 1) -> float:
-    """Maker fee is 1/4 of taker"""
-    return calc_taker_fee_cents(price_cents, qty) / 4
+
+def fee_aware_min_edge(price_cents: int, stop_loss_cents: int = 15,
+                       lock_prob: float = 0.55) -> float:
+    """
+    P5: Minimum edge needed to be +EV after round-trip fees.
+    Conservative lock_prob=0.55 (last night was ~64% win but still lost money).
+    """
+    entry_fee = calc_taker_fee(price_cents, 1)
+    exit_fee = calc_taker_fee(price_cents, 1)  # approximate
+    total_fees = entry_fee + exit_fee
+
+    # EV = P(lock) × (lock_profit - fees) - P(stop) × (stop + fees)
+    # For breakeven: lock_profit_needed = P(stop)/P(lock) × (stop + fees) + fees
+    p_stop = 1.0 - lock_prob
+    needed = (p_stop / lock_prob) * (stop_loss_cents + total_fees) + total_fees
+    return needed
+
 
 # =============================================================================
-# LIQUIDITY CHECKING (CRITICAL FIX)
+# MARKET QUALITY FILTER (P3)
 # =============================================================================
 
-def _cum_qty_at_or_above(levels: List[List[int]], price_threshold: int) -> int:
-    """Sum quantity for all price levels >= threshold"""
-    cum = 0
-    for p, q in levels:
-        if int(p) >= int(price_threshold):
-            cum += int(q)
-        else:
-            break
-    return cum
+class MarketQualityMonitor:
+    """
+    P3: Tracks market quality metrics over a warmup window.
+    Allows strategies to skip dead/illiquid markets.
+    """
 
-def has_fill_liquidity_for_implied_buy(
-    prices: Dict[str, Any], 
-    side_to_buy: str, 
-    buy_price_c: int, 
-    min_qty: int
-) -> bool:
-    """
-    CRITICAL: For implied ask buy, check OPPOSITE book liquidity.
-    
-    - Buying YES at price p fills against NO bids >= (100 - p)
-    - Buying NO at price q fills against YES bids >= (100 - q)
-    """
-    yes_levels = prices.get("yes_levels", [])
-    no_levels = prices.get("no_levels", [])
-    
-    if side_to_buy == "yes":
-        needed_no_bid = 100 - int(buy_price_c)
-        return _cum_qty_at_or_above(no_levels, needed_no_bid) >= min_qty
-    else:
-        needed_yes_bid = 100 - int(buy_price_c)
-        return _cum_qty_at_or_above(yes_levels, needed_yes_bid) >= min_qty
+    def __init__(self, warmup_samples: int = 40, warmup_secs: int = 180):
+        self.warmup_samples = warmup_samples
+        self.warmup_secs = warmup_secs
+        self.midpoints: deque = deque(maxlen=200)
+        self.spreads: deque = deque(maxlen=200)
+        self.first_sample_time: Optional[float] = None
+        self._quality_decided = False
+        self._quality_ok = False
+        self._quality_reason = ""
+
+    def update(self, mid: Optional[float], spread: Optional[int]):
+        if self.first_sample_time is None:
+            self.first_sample_time = time.time()
+        if mid is not None:
+            self.midpoints.append(mid)
+        if spread is not None:
+            self.spreads.append(spread)
+
+    def is_warmup_complete(self) -> bool:
+        if self.first_sample_time is None:
+            return False
+        elapsed = time.time() - self.first_sample_time
+        return len(self.midpoints) >= self.warmup_samples and elapsed >= self.warmup_secs
+
+    def is_tradeable(self) -> Tuple[bool, str]:
+        """
+        Returns (tradeable, reason).
+        Only decides once after warmup, then caches.
+        Re-evaluates periodically for ongoing dead-market detection.
+        """
+        if not self.is_warmup_complete():
+            return False, f"warmup:{len(self.midpoints)}/{self.warmup_samples}"
+
+        prices = list(self.midpoints)
+        if len(prices) < 10:
+            return False, "insufficient_data"
+
+        # Metrics over recent window
+        recent = prices[-60:] if len(prices) >= 60 else prices
+        price_range = max(recent) - min(recent)
+        mean = sum(recent) / len(recent)
+        var = sum((p - mean) ** 2 for p in recent) / len(recent)
+        std = math.sqrt(var) if var > 0 else 0
+
+        # Spread check
+        recent_spreads = list(self.spreads)[-30:] if len(self.spreads) >= 30 else list(self.spreads)
+        avg_spread = sum(recent_spreads) / len(recent_spreads) if recent_spreads else 99
+
+        # P3 criteria: skip if std <3¢, range <5¢, or spread >6¢ consistently
+        if std < 3.0:
+            return False, f"dead_market:std={std:.1f}c"
+        if price_range < 5.0:
+            return False, f"dead_market:range={price_range:.1f}c"
+        if avg_spread > 6.0:
+            return False, f"illiquid:avg_spread={avg_spread:.1f}c"
+
+        return True, f"ok:std={std:.1f},range={price_range:.1f},spread={avg_spread:.1f}"
+
+    def recent_volatility(self) -> float:
+        """Return std of last 30 midpoints"""
+        if len(self.midpoints) < 5:
+            return 0.0
+        recent = list(self.midpoints)[-30:]
+        mean = sum(recent) / len(recent)
+        var = sum((p - mean) ** 2 for p in recent) / len(recent)
+        return math.sqrt(var) if var > 0 else 0.0
+
+    def has_recent_movement(self, lookback: int = 30, min_move: float = 3.0) -> bool:
+        """P2: Dead market detection — any >min_move¢ swing in last N samples?"""
+        if len(self.midpoints) < lookback:
+            return True  # benefit of doubt during warmup
+        recent = list(self.midpoints)[-lookback:]
+        return (max(recent) - min(recent)) >= min_move
+
 
 # =============================================================================
 # DATA STRUCTURES
@@ -112,21 +161,19 @@ def has_fill_liquidity_for_implied_buy(
 
 @dataclass
 class Position:
-    """Open position tracking"""
     id: str
     strategy: str
-    side: str
+    side: str          # "yes" or "no"
     entry_price: float
     qty: int
     entry_time: dt.datetime
     entry_reason: str
     entry_fee: float = 0.0
-    entry_edge: float = 0.0
-    order_id: str = ""
+    lock_attempts: int = 0  # P5: track lock attempts
+
 
 @dataclass
 class ClosedPosition:
-    """Completed trade record"""
     id: str
     strategy: str
     side: str
@@ -135,362 +182,110 @@ class ClosedPosition:
     qty: int
     entry_time: str
     exit_time: str
-    exit_type: str  # "lock", "stop", "take_profit", "timeout"
+    exit_type: str      # "lock", "stop", "take_profit", "timeout"
     entry_fee: float
     exit_fee: float
     gross_pnl: float
     net_pnl: float
     hold_secs: int
     lock_price: Optional[float] = None
-    lock_side: Optional[str] = None
-    entry_edge: float = 0.0
-    exit_reason: str = ""
 
-@dataclass
-class TradeEvent:
-    """Individual trade action for detailed logging"""
-    timestamp: str
-    strategy: str
-    action: str  # "entry_attempt", "entry_fill", "exit_attempt", "exit_fill", "cancel"
-    side: str
-    price: float
-    qty: int
-    filled_qty: int = 0
-    vwap: Optional[float] = None
-    fee_cents: float = 0.0
-    reason: str = ""
-    order_id: str = ""
-    position_id: str = ""
-    liquidity_ok: bool = True
-    was_maker_attempt: bool = False
 
 # =============================================================================
-# CENTRALIZED EXECUTION MODULE
-# =============================================================================
-
-class OrderExecutor:
-    """Centralized order execution with proper checks and logging"""
-    
-    def __init__(self, private_key, ticker: str, game_label: str):
-        self.private_key = private_key
-        self.ticker = ticker
-        self.game_label = game_label
-        self.trade_events: List[TradeEvent] = []
-    
-    def execute_entry(
-        self,
-        strategy_name: str,
-        side: str,
-        price: int,
-        qty: int,
-        prices: Dict[str, Any],
-        reason: str,
-        position_id: str
-    ) -> Tuple[int, Optional[float], float]:
-        """
-        Execute entry order with liquidity check.
-        
-        Returns: (filled_qty, vwap, fee_cents)
-        """
-        # CRITICAL: Check liquidity before attempting
-        has_liquidity = has_fill_liquidity_for_implied_buy(
-            prices, side, price, max(MIN_LIQUIDITY_CONTRACTS, qty)
-        )
-        
-        event = TradeEvent(
-            timestamp=utc_now().isoformat(),
-            strategy=strategy_name,
-            action="entry_attempt",
-            side=side,
-            price=price,
-            qty=qty,
-            reason=reason,
-            position_id=position_id,
-            liquidity_ok=has_liquidity,
-        )
-        
-        if not has_liquidity:
-            print_status(
-                f"[{self.game_label}][{strategy_name}] SKIP ENTRY: "
-                f"{side.upper()} @{price}¢ - insufficient opposite-book liquidity"
-            )
-            self.trade_events.append(event)
-            return 0, None, 0.0
-        
-        print_status(
-            f"[{self.game_label}][{strategy_name}] ENTRY: "
-            f"BUY {side.upper()} {qty}x @{price}¢ - {reason}"
-        )
-        
-        try:
-            order_id = place_limit_buy(self.private_key, self.ticker, side, price, qty)
-            event.order_id = order_id
-            
-            filled, vwap = wait_for_fill_or_timeout(
-                self.private_key, order_id, side, max_wait_secs=15, poll_secs=2
-            )
-            
-            if filled > 0:
-                actual_price = vwap if vwap else float(price)
-                fee = calc_taker_fee_cents(actual_price, filled)
-                
-                fill_event = TradeEvent(
-                    timestamp=utc_now().isoformat(),
-                    strategy=strategy_name,
-                    action="entry_fill",
-                    side=side,
-                    price=price,
-                    qty=qty,
-                    filled_qty=filled,
-                    vwap=actual_price,
-                    fee_cents=fee,
-                    reason=reason,
-                    order_id=order_id,
-                    position_id=position_id,
-                )
-                self.trade_events.append(fill_event)
-                
-                print_status(
-                    f"[{self.game_label}][{strategy_name}] FILLED: "
-                    f"{filled}x @{actual_price:.2f}¢ (fee: {fee:.2f}¢)"
-                )
-                
-                return filled, actual_price, fee
-            else:
-                print_status(
-                    f"[{self.game_label}][{strategy_name}] NO FILL (timeout)"
-                )
-                self.trade_events.append(event)
-                return 0, None, 0.0
-                
-        except Exception as e:
-            print_status(
-                f"[{self.game_label}][{strategy_name}] ENTRY ERROR: {e}"
-            )
-            event.reason = f"error: {e}"
-            self.trade_events.append(event)
-            return 0, None, 0.0
-    
-    def execute_exit(
-        self,
-        strategy_name: str,
-        position: Position,
-        exit_type: str,
-        exit_price: int,
-        reason: str,
-        prices: Dict[str, Any]
-    ) -> Tuple[int, Optional[float], float, Optional[float], Optional[str]]:
-        """
-        Execute exit order (sell or lock).
-        
-        Returns: (filled_qty, exit_vwap, exit_fee, lock_price, lock_side)
-        """
-        print_status(
-            f"[{self.game_label}][{strategy_name}] EXIT: "
-            f"{position.side.upper()} @{exit_price}¢ ({exit_type}) - {reason}"
-        )
-        
-        lock_price = None
-        lock_side = None
-        
-        try:
-            if exit_type == "lock":
-                # Lock = buy the opposite side
-                lock_side = "no" if position.side == "yes" else "yes"
-                
-                # Check liquidity for lock
-                has_liquidity = has_fill_liquidity_for_implied_buy(
-                    prices, lock_side, exit_price, position.qty
-                )
-                
-                if not has_liquidity:
-                    print_status(
-                        f"[{self.game_label}][{strategy_name}] SKIP LOCK: "
-                        f"insufficient liquidity for {lock_side.upper()} @{exit_price}¢"
-                    )
-                    return 0, None, 0.0, None, None
-                
-                order_id = place_limit_buy(
-                    self.private_key, self.ticker, lock_side, exit_price, position.qty
-                )
-                
-                filled, vwap = wait_for_fill_or_timeout(
-                    self.private_key, order_id, lock_side, max_wait_secs=15, poll_secs=2
-                )
-                
-                if filled > 0:
-                    lock_price = vwap if vwap else float(exit_price)
-                    fee = calc_taker_fee_cents(lock_price, filled)
-                    
-                    event = TradeEvent(
-                        timestamp=utc_now().isoformat(),
-                        strategy=strategy_name,
-                        action="exit_fill",
-                        side=lock_side,
-                        price=exit_price,
-                        qty=position.qty,
-                        filled_qty=filled,
-                        vwap=lock_price,
-                        fee_cents=fee,
-                        reason=f"lock_{reason}",
-                        order_id=order_id,
-                        position_id=position.id,
-                    )
-                    self.trade_events.append(event)
-                    
-                    return filled, lock_price, fee, lock_price, lock_side
-                else:
-                    print_status(
-                        f"[{self.game_label}][{strategy_name}] LOCK NO FILL"
-                    )
-                    return 0, None, 0.0, None, None
-            
-            else:
-                # Regular exit = sell current position
-                order_id = place_limit_sell(
-                    self.private_key, self.ticker, position.side, exit_price, position.qty
-                )
-                
-                filled, vwap = wait_for_fill_or_timeout(
-                    self.private_key, order_id, position.side, max_wait_secs=15, poll_secs=2
-                )
-                
-                if filled > 0:
-                    exit_vwap = vwap if vwap else float(exit_price)
-                    fee = calc_taker_fee_cents(exit_vwap, filled)
-                    
-                    event = TradeEvent(
-                        timestamp=utc_now().isoformat(),
-                        strategy=strategy_name,
-                        action="exit_fill",
-                        side=position.side,
-                        price=exit_price,
-                        qty=position.qty,
-                        filled_qty=filled,
-                        vwap=exit_vwap,
-                        fee_cents=fee,
-                        reason=reason,
-                        order_id=order_id,
-                        position_id=position.id,
-                    )
-                    self.trade_events.append(event)
-                    
-                    return filled, exit_vwap, fee, None, None
-                else:
-                    print_status(
-                        f"[{self.game_label}][{strategy_name}] EXIT NO FILL"
-                    )
-                    return 0, None, 0.0, None, None
-                    
-        except Exception as e:
-            print_status(
-                f"[{self.game_label}][{strategy_name}] EXIT ERROR: {e}"
-            )
-            return 0, None, 0.0, None, None
-
-# =============================================================================
-# BASE STRATEGY CLASS (WITH FIXES)
+# BASE STRATEGY
 # =============================================================================
 
 class BaseStrategy(ABC):
-    """Abstract base for all strategies"""
-    
+
     def __init__(self, name: str, max_capital: float, params: Dict[str, Any]):
         self.name = name
         self.max_capital = max_capital
         self.params = params
-        
-        # State
+
         self.positions: List[Position] = []
         self.closed: List[ClosedPosition] = []
         self.capital_used = 0.0
         self.position_counter = 0
-        
+
         # Throttling
         self.last_entry_time: Optional[float] = None
         self.min_entry_gap_secs = params.get("min_entry_gap_secs", 45)
-        
-        # Tracking
+
+        # P1: Per-side re-entry cooldown tracking
+        self._side_last_stop: Dict[str, float] = {}  # side -> timestamp of last stop
+        self._side_cooldown_secs = params.get("side_cooldown_secs", 120)
+
         self.total_fees = 0.0
-    
+
     def _next_position_id(self) -> str:
         self.position_counter += 1
         return f"{self.name}_{self.position_counter}"
-    
-    def can_enter(self) -> Tuple[bool, str]:
-        """Check if we can enter a new position"""
-        if self.capital_used >= self.max_capital * 0.95:  # 95% buffer
-            return False, f"capital:{self.capital_used:.2f}/{self.max_capital:.2f}"
-        
+
+    def can_enter(self, secs_to_close: int = 9999) -> Tuple[bool, str]:
+        # Capital limit
+        if self.capital_used >= self.max_capital:
+            return False, "max_capital"
+
+        # Position limit
         if len(self.positions) >= self.params.get("max_positions", 2):
-            return False, f"max_positions:{len(self.positions)}"
-        
+            return False, "max_positions"
+
+        # P1: Final 5-minute lockout (configurable)
+        lockout_secs = self.params.get("stop_trading_before_close_secs", 300)
+        if secs_to_close < lockout_secs:
+            return False, f"near_close:{int(secs_to_close)}s"
+
+        # General throttle
         if self.last_entry_time:
             elapsed = time.time() - self.last_entry_time
             if elapsed < self.min_entry_gap_secs:
-                return False, f"throttle:{elapsed:.0f}s<{self.min_entry_gap_secs}s"
-        
+                return False, f"throttle:{elapsed:.0f}s"
+
         return True, "ok"
+
+    def _side_on_cooldown(self, side: str) -> Tuple[bool, str]:
+        """P1: Check if a side is on post-stop cooldown"""
+        last_stop = self._side_last_stop.get(side)
+        if last_stop is None:
+            return False, "ok"
+        elapsed = time.time() - last_stop
+        if elapsed < self._side_cooldown_secs:
+            return True, f"side_cooldown:{side}:{elapsed:.0f}s/{self._side_cooldown_secs}s"
+        return False, "ok"
     
-    def _size_position(self, edge_cents: float, price: int, side: str) -> int:
-        """Size position based on edge and available capital"""
-        # Calculate collateral needed per contract
-        if side == "yes":
-            collateral_per = (100 - price) / 100
-        else:
-            collateral_per = price / 100
-        
-        # Max affordable
-        available_capital = self.max_capital - self.capital_used
-        max_affordable = int(available_capital / collateral_per) if collateral_per > 0 else 0
-        
-        # Edge-based sizing
-        if edge_cents < 8:
-            base_qty = 1
-        elif edge_cents < 12:
-            base_qty = 2
-        elif edge_cents < 18:
-            base_qty = 3
-        else:
-            base_qty = 4
-        
-        # Cap at max
-        return min(base_qty, max_affordable, 5)
-    
+    def entry_wait_secs(self, context: Dict[str, Any]) -> int:
+        """How long the GameRunner should wait for an entry fill before cancel."""
+        return 15
+
+    def on_entry_result(self, filled: bool, context: Dict[str, Any]) -> None:
+        """Called by GameRunner after an entry attempt, even if no fill."""
+        return
+
     @abstractmethod
     def evaluate_entry(
         self,
         prices: Dict[str, Any],
-        game_context: Dict[str, Any]
-    ) -> Tuple[bool, str, int, int, str, float]:
-        """
-        Returns: (should_enter, side, price, qty, reason, edge)
-        """
+        secs_to_close: int,
+        context: Dict[str, Any],
+    ) -> Tuple[bool, str, int, int, str]:
+        """Returns: (should_enter, side, price, qty, reason)"""
         pass
-    
+
     @abstractmethod
     def evaluate_exit(
         self,
         position: Position,
         prices: Dict[str, Any],
-        game_context: Dict[str, Any]
+        secs_to_close: int,
+        context: Dict[str, Any],
     ) -> Tuple[bool, str, int, str]:
-        """
-        Returns: (should_exit, exit_type, exit_price, reason)
-        """
+        """Returns: (should_exit, exit_type, exit_price, reason)"""
         pass
-    
-    def record_entry(
-        self,
-        side: str,
-        price: float,
-        qty: int,
-        reason: str,
-        fee: float,
-        edge: float,
-        order_id: str = ""
-    ) -> Position:
-        """Record new position"""
+
+    def record_entry(self, side: str, price: float, qty: int, reason: str) -> Position:
+        fee = calc_taker_fee(int(price), qty)
+        self.total_fees += fee
+
         pos = Position(
             id=self._next_position_id(),
             strategy=self.name,
@@ -500,44 +295,38 @@ class BaseStrategy(ABC):
             entry_time=utc_now(),
             entry_reason=reason,
             entry_fee=fee,
-            entry_edge=edge,
-            order_id=order_id,
         )
-        
+
         self.positions.append(pos)
         self.last_entry_time = time.time()
-        self.total_fees += fee
-        
-        # Update capital
+
         if side == "yes":
             self.capital_used += (100 - price) * qty / 100
         else:
             self.capital_used += price * qty / 100
-        
+
         return pos
-    
+
     def record_exit(
         self,
         position: Position,
         exit_type: str,
         exit_price: float,
-        exit_fee: float,
-        reason: str,
         lock_price: Optional[float] = None,
-        lock_side: Optional[str] = None
     ) -> ClosedPosition:
-        """Record position exit"""
-        # Calculate P&L
+        exit_fee = calc_taker_fee(int(exit_price), position.qty)
+        self.total_fees += exit_fee
+
         if exit_type == "lock" and lock_price is not None:
             gross_pnl = (100 - position.entry_price - lock_price) * position.qty
         else:
             gross_pnl = (exit_price - position.entry_price) * position.qty
-        
+
         net_pnl = gross_pnl - position.entry_fee - exit_fee
-        
+
         now = utc_now()
         hold_secs = int((now - position.entry_time).total_seconds())
-        
+
         closed = ClosedPosition(
             id=position.id,
             strategy=self.name,
@@ -554,25 +343,25 @@ class BaseStrategy(ABC):
             net_pnl=net_pnl,
             hold_secs=hold_secs,
             lock_price=lock_price,
-            lock_side=lock_side,
-            entry_edge=position.entry_edge,
-            exit_reason=reason,
         )
-        
+
         self.closed.append(closed)
         self.positions.remove(position)
-        self.total_fees += exit_fee
-        
+
         # Free capital
         if position.side == "yes":
             self.capital_used -= (100 - position.entry_price) * position.qty / 100
         else:
             self.capital_used -= position.entry_price * position.qty / 100
-        
+        self.capital_used = max(0, self.capital_used)
+
+        # P1: Record stop-out for cooldown
+        if exit_type == "stop":
+            self._side_last_stop[position.side] = time.time()
+
         return closed
-    
+
     def get_stats(self) -> Dict[str, Any]:
-        """Performance statistics"""
         if not self.closed:
             return {
                 "strategy": self.name,
@@ -581,46 +370,52 @@ class BaseStrategy(ABC):
                 "losses": 0,
                 "locks": 0,
                 "stops": 0,
-                "gross_pnl": 0.0,
+                "lock_rate": 0.0,
+                "gross_pnl": 0,
                 "fees": self.total_fees,
                 "net_pnl": -self.total_fees,
-                "open_positions": len(self.positions),
-                "capital_used": self.capital_used,
             }
-        
+
         gross = sum(c.gross_pnl for c in self.closed)
         net = sum(c.net_pnl for c in self.closed)
         wins = [c for c in self.closed if c.net_pnl > 0]
         losses = [c for c in self.closed if c.net_pnl <= 0]
         locks = [c for c in self.closed if c.exit_type == "lock"]
         stops = [c for c in self.closed if c.exit_type == "stop"]
-        
+
         return {
             "strategy": self.name,
             "trades": len(self.closed),
             "wins": len(wins),
             "losses": len(losses),
-            "win_rate": len(wins) / len(self.closed) if self.closed else 0,
+            "win_rate": len(wins) / len(self.closed),
             "locks": len(locks),
-            "lock_rate": len(locks) / len(self.closed) if self.closed else 0,
             "stops": len(stops),
+            "lock_rate": len(locks) / len(self.closed) if self.closed else 0,
             "gross_pnl": gross,
             "fees": self.total_fees,
             "net_pnl": net,
             "avg_hold_secs": sum(c.hold_secs for c in self.closed) / len(self.closed),
-            "avg_win": sum(c.net_pnl for c in wins) / len(wins) if wins else 0,
-            "avg_loss": sum(c.net_pnl for c in losses) / len(losses) if losses else 0,
             "open_positions": len(self.positions),
-            "capital_used": self.capital_used,
         }
 
+
 # =============================================================================
-# STRATEGY IMPLEMENTATIONS (WITH FIXES)
+# STRATEGY 1: MODEL EDGE (with P1 circuit breakers + P5 fee awareness)
 # =============================================================================
 
 class ModelEdgeStrategy(BaseStrategy):
-    """Model-based edge strategy with dynamic fair price"""
+    """
+    Enter when market differs from model fair price.
     
+    Feb 6 fixes:
+      - P1a: Divergence filter (block when |market - model| > divergence_cap)
+      - P1b: Final 5min lockout (inherited from BaseStrategy)
+      - P1c: Re-entry cooldown after stop (inherited, 120s)
+      - P1d: Market decided filter (skip if market >88¢ or <12¢)
+      - P5:  Fee-aware minimum edge
+    """
+
     def __init__(self, max_capital: float, model_fair_cents: int):
         params = {
             "min_entry_edge": 10,
@@ -629,229 +424,478 @@ class ModelEdgeStrategy(BaseStrategy):
             "take_profit": 12,
             "max_positions": 2,
             "min_entry_gap_secs": 45,
+            "side_cooldown_secs": 120,       # P1c
+            "stop_trading_before_close_secs": 300,  # P1b
+            "divergence_cap_cents": 20,      # P1a
+            "market_decided_hi": 88,         # P1d
+            "market_decided_lo": 12,         # P1d
+            "max_lock_attempts": 2,          # P5
         }
         super().__init__("model_edge", max_capital, params)
         self.model_fair = model_fair_cents
-        self.price_history: deque = deque(maxlen=30)
-    
+        self.price_history: deque = deque(maxlen=60)
+
     def _get_dynamic_fair(
-        self, 
-        current_mid: float, 
-        game_secs_remaining: Optional[int]
-    ) -> float:
-        """Blend model with market based on REAL game time"""
-        self.price_history.append(current_mid)
-        
-        if game_secs_remaining is None:
-            # No game clock - use moderate blend
-            if len(self.price_history) < 5:
-                return float(self.model_fair)
-            market_avg = sum(self.price_history) / len(self.price_history)
-            return 0.6 * self.model_fair + 0.4 * market_avg
-        
-        # Use actual game progress
-        total_game_secs = 2400  # 40 minutes
-        game_elapsed = max(0, total_game_secs - game_secs_remaining)
-        game_progress = min(1.0, game_elapsed / total_game_secs)
-        
-        # Exponential decay of model confidence
-        model_weight = math.exp(-2 * game_progress)
-        market_avg = sum(self.price_history) / len(self.price_history)
-        
-        return model_weight * self.model_fair + (1 - model_weight) * market_avg
-    
-    def evaluate_entry(
         self,
-        prices: Dict[str, Any],
-        game_context: Dict[str, Any]
-    ) -> Tuple[bool, str, int, int, str, float]:
+        current_mid: float,
+        secs_to_close: int,
+        espn_live_win_pct: Optional[float],
+        game_progress: Optional[float],
+    ) -> float:
+        """
+        New behavior:
+        - If ESPN win% is available: blend pregame model -> ESPN with aggressive decay (3.5)
+        - Else: fallback to legacy blend pregame model -> market midpoint (decay 2.0)
+        """
+        self.price_history.append(current_mid)
+
+        total_game = 2400
+        elapsed = max(0, total_game - secs_to_close)
+        progress = min(1.0, elapsed / total_game)
+
+        # Prefer ESPN-supplied progress if available
+        if isinstance(game_progress, (int, float)):
+            progress = float(max(0.0, min(1.0, game_progress)))
+
+        # ESPN blend path
+        if isinstance(espn_live_win_pct, (int, float)):
+            espn_pct = float(espn_live_win_pct)
+            # allow 0..1 input; if 0..100 mistakenly arrives, normalize
+            if espn_pct > 1.0:
+                espn_pct /= 100.0
+            espn_cents = espn_pct * 100.0
+
+            model_weight = math.exp(-3.5 * progress)
+            return model_weight * float(self.model_fair) + (1 - model_weight) * espn_cents
+
+        # Fallback: market blend
+        model_weight = math.exp(-2.0 * progress)
+        market_mid = sum(self.price_history) / len(self.price_history)
+        return model_weight * float(self.model_fair) + (1 - model_weight) * market_mid
+
+    def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
         yes_bid = prices.get("best_yes_bid")
         yes_ask = prices.get("imp_yes_ask")
         no_ask = prices.get("imp_no_ask")
-        
+
         if not all([yes_bid, yes_ask]):
-            return False, "", 0, 0, "no_prices", 0.0
-        
+            return False, "", 0, 0, "no_prices"
+
         mid = (yes_bid + yes_ask) / 2
-        game_secs = game_context.get("game_secs_remaining")
-        fair = self._get_dynamic_fair(mid, game_secs)
-        
+
+        # --- P1d: Market decided filter ---
+        hi = self.params["market_decided_hi"]
+        lo = self.params["market_decided_lo"]
+        if mid > hi or mid < lo:
+            return False, "", 0, 0, f"market_decided:{mid:.0f}c"
+
+        espn_wp = context.get("espn_live_win_pct")
+        game_progress = context.get("game_progress")
+        fair = self._get_dynamic_fair(mid, secs_to_close, espn_wp, game_progress)
+
+
+        # --- P1a: Divergence filter ---
+        divergence = abs(mid - fair)
+
+        cap = self.params["divergence_cap_cents"]
+        if divergence > cap:
+            return False, "", 0, 0, f"divergence:{divergence:.0f}c>{cap}c"
+
+        # --- P5: Fee-aware minimum edge ---
+        base_min_edge = self.params["min_entry_edge"]
+        fee_min_edge = fee_aware_min_edge(
+            int(mid), stop_loss_cents=self.params["stop_loss"]
+        )
+        effective_min_edge = max(base_min_edge, int(math.ceil(fee_min_edge)))
+
         # Check YES side
         yes_edge = fair - yes_ask
-        if yes_edge >= self.params["min_entry_edge"]:
-            qty = self._size_position(yes_edge, yes_ask, "yes")
-            if qty > 0:
-                return True, "yes", yes_ask, qty, f"edge:{yes_edge:.1f}¢,fair:{fair:.1f}¢", yes_edge
-        
+        # P1c: side cooldown
+        yes_cooled, _ = self._side_on_cooldown("yes")
+
+        if yes_edge >= effective_min_edge and not yes_cooled:
+            return True, "yes", int(yes_ask), 1, \
+                f"edge:{yes_edge:.1f}c,fair:{fair:.1f}c,minE:{effective_min_edge}"
+
         # Check NO side
         if no_ask:
             no_fair = 100 - fair
             no_edge = no_fair - no_ask
-            if no_edge >= self.params["min_entry_edge"]:
-                qty = self._size_position(no_edge, no_ask, "no")
-                if qty > 0:
-                    return True, "no", no_ask, qty, f"edge:{no_edge:.1f}¢,fair:{fair:.1f}¢", no_edge
-        
-        return False, "", 0, 0, "no_edge", 0.0
-    
-    def evaluate_exit(
-        self,
-        position: Position,
-        prices: Dict[str, Any],
-        game_context: Dict[str, Any]
-    ) -> Tuple[bool, str, int, str]:
+            no_cooled, _ = self._side_on_cooldown("no")
+
+            if no_edge >= effective_min_edge and not no_cooled:
+                return True, "no", int(no_ask), 1, \
+                    f"edge:{no_edge:.1f}c,fair:{fair:.1f}c,minE:{effective_min_edge}"
+
+        return False, "", 0, 0, "no_edge"
+
+    def evaluate_exit(self, position, prices, secs_to_close, context) -> Tuple[bool, str, int, str]:
         yes_bid = prices.get("best_yes_bid")
         no_bid = prices.get("best_no_bid")
         no_ask = prices.get("imp_no_ask")
         yes_ask = prices.get("imp_yes_ask")
-        
+
         if position.side == "yes":
-            # Try to lock first (FIXED: use correct imp_no_ask)
-            if no_ask:
+            # Try to lock (P5: respect max lock attempts)
+            if no_ask and position.lock_attempts < self.params["max_lock_attempts"]:
                 profit = 100 - position.entry_price - no_ask
                 if profit >= self.params["min_lock_profit"]:
-                    return True, "lock", no_ask, f"lock:{profit:.0f}¢"
-            
-            # Stop/take profit
+                    position.lock_attempts += 1
+                    return True, "lock", int(no_ask), f"lock:{profit:.0f}c"
+
             if yes_bid:
                 pnl = yes_bid - position.entry_price
                 if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", yes_bid - 1, f"stop:{pnl:.0f}¢"
+                    return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
                 if pnl >= self.params["take_profit"]:
-                    return True, "take_profit", yes_bid - 1, f"tp:{pnl:.0f}¢"
-        
-        else:  # NO position
-            # Try to lock (FIXED: use correct imp_yes_ask)
-            if yes_ask:
+                    return True, "take_profit", int(yes_bid) - 1, f"tp:{pnl:.0f}c"
+        else:
+            if yes_ask and position.lock_attempts < self.params["max_lock_attempts"]:
                 profit = 100 - position.entry_price - yes_ask
                 if profit >= self.params["min_lock_profit"]:
-                    return True, "lock", yes_ask, f"lock:{profit:.0f}¢"
-            
-            # Stop/take profit
+                    position.lock_attempts += 1
+                    return True, "lock", int(yes_ask), f"lock:{profit:.0f}c"
+
             if no_bid:
                 pnl = no_bid - position.entry_price
                 if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", no_bid - 1, f"stop:{pnl:.0f}¢"
+                    return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
                 if pnl >= self.params["take_profit"]:
-                    return True, "take_profit", no_bid - 1, f"tp:{pnl:.0f}¢"
-        
+                    return True, "take_profit", int(no_bid) - 1, f"tp:{pnl:.0f}c"
+
         return False, "", 0, "hold"
 
 
+# =============================================================================
+# STRATEGY 2: MEAN REVERSION (P2 adaptive threshold + dead market detection)
+# =============================================================================
+
 class MeanReversionStrategy(BaseStrategy):
-    """Pure price-based mean reversion"""
+    """
+    Buy when price drops sharply below SMA, exit on reversion.
     
+    Feb 6 fixes:
+      - P2a: Dynamic σ multiplier (2.5σ if vol <5¢, else 1.5σ)
+      - P2b: Require 60 samples + recent range >5¢ before first entry
+      - P2c: Dead market detection (stop if no >3¢ move in last 30 samples)
+    """
+
     def __init__(self, max_capital: float):
         params = {
-            "lookback": 60,  # FIXED: Increased from 20
-            "entry_std_mult": 1.5,
+            "lookback": 60,
+            "base_std_mult": 1.5,
+            "high_vol_std_mult": 1.5,   # normal threshold
+            "low_vol_std_mult": 2.5,    # P2a: tighter in quiet markets
+            "low_vol_cutoff": 5.0,      # P2a: σ below this = "low vol"
             "stop_loss": 15,
             "max_positions": 2,
             "min_entry_gap_secs": 30,
+            "side_cooldown_secs": 90,
+            "stop_trading_before_close_secs": 300,
+            "warmup_samples": 60,       # P2b
+            "warmup_min_range": 5.0,    # P2b
+            "dead_lookback": 30,        # P2c
+            "dead_min_move": 3.0,       # P2c
         }
         super().__init__("mean_reversion", max_capital, params)
         self.prices: deque = deque(maxlen=params["lookback"])
-    
+        self._warmup_done = False
+
     def _calc_stats(self) -> Tuple[float, float]:
-        if len(self.prices) < 10:
+        if len(self.prices) < 5:
             return 50.0, 10.0
-        
         prices = list(self.prices)
         mean = sum(prices) / len(prices)
         var = sum((p - mean) ** 2 for p in prices) / len(prices)
         std = math.sqrt(var) if var > 0 else 5.0
-        
         return mean, std
-    
-    def evaluate_entry(
-        self,
-        prices: Dict[str, Any],
-        game_context: Dict[str, Any]
-    ) -> Tuple[bool, str, int, int, str, float]:
+
+    def _check_warmup(self) -> Tuple[bool, str]:
+        """P2b: Require N samples AND sufficient range"""
+        n = len(self.prices)
+        if n < self.params["warmup_samples"]:
+            return False, f"warmup:{n}/{self.params['warmup_samples']}"
+
+        recent = list(self.prices)
+        price_range = max(recent) - min(recent)
+        if price_range < self.params["warmup_min_range"]:
+            return False, f"warmup_range:{price_range:.1f}c<{self.params['warmup_min_range']}c"
+
+        return True, "ok"
+
+    def _is_dead_market(self) -> bool:
+        """P2c: No meaningful movement in recent samples"""
+        lookback = self.params["dead_lookback"]
+        if len(self.prices) < lookback:
+            return False
+        recent = list(self.prices)[-lookback:]
+        return (max(recent) - min(recent)) < self.params["dead_min_move"]
+
+    def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
         yes_bid = prices.get("best_yes_bid")
         yes_ask = prices.get("imp_yes_ask")
         no_ask = prices.get("imp_no_ask")
-        
-        # FIXED: Skip early game volatility
-        game_secs = game_context.get("game_secs_remaining")
-        if game_secs and game_secs > 2200:
-            return False, "", 0, 0, "game_too_early", 0.0
-        
+
         if not yes_bid or not yes_ask:
-            return False, "", 0, 0, "no_prices", 0.0
-        
+            return False, "", 0, 0, "no_prices"
+
         mid = (yes_bid + yes_ask) / 2
         self.prices.append(mid)
-        
-        if len(self.prices) < 20:  # Need 20 samples minimum
-            return False, "", 0, 0, f"warming:{len(self.prices)}/20", 0.0
-        
+
+        # P2b: Warmup check
+        warmup_ok, warmup_reason = self._check_warmup()
+        if not warmup_ok:
+            return False, "", 0, 0, warmup_reason
+
+        # P2c: Dead market check
+        if self._is_dead_market():
+            return False, "", 0, 0, "dead_market"
+
         mean, std = self._calc_stats()
-        threshold = self.params["entry_std_mult"] * std
-        
-        # Price dropped - buy YES
+
+        # P2a: Dynamic σ multiplier
+        if std < self.params["low_vol_cutoff"]:
+            std_mult = self.params["low_vol_std_mult"]
+        else:
+            std_mult = self.params["high_vol_std_mult"]
+
+        threshold = std_mult * std
+
+        # Price dropped → buy YES
         if mid < mean - threshold:
             edge = mean - mid
-            # Fee-aware: need enough edge to overcome fees
-            min_edge = 8 + calc_taker_fee_cents(yes_ask, 1) * 2
-            if edge >= min_edge:
-                qty = self._size_position(edge, yes_ask, "yes")
-                if qty > 0:
-                    return True, "yes", yes_ask, qty, f"below:{edge:.0f}¢({edge/std:.1f}σ)", edge
-        
-        # Price spiked - buy NO
+            cooled, _ = self._side_on_cooldown("yes")
+            if not cooled:
+                return True, "yes", int(yes_ask), 1, \
+                    f"below:{edge:.0f}c({edge/std:.1f}σ),mult={std_mult}"
+
+        # Price spiked → buy NO
         if mid > mean + threshold and no_ask:
             edge = mid - mean
-            min_edge = 8 + calc_taker_fee_cents(no_ask, 1) * 2
-            if edge >= min_edge:
-                qty = self._size_position(edge, no_ask, "no")
-                if qty > 0:
-                    return True, "no", no_ask, qty, f"above:{edge:.0f}¢({edge/std:.1f}σ)", edge
-        
-        return False, "", 0, 0, "in_range", 0.0
-    
-    def evaluate_exit(
-        self,
-        position: Position,
-        prices: Dict[str, Any],
-        game_context: Dict[str, Any]
-    ) -> Tuple[bool, str, int, str]:
+            cooled, _ = self._side_on_cooldown("no")
+            if not cooled:
+                return True, "no", int(no_ask), 1, \
+                    f"above:{edge:.0f}c({edge/std:.1f}σ),mult={std_mult}"
+
+        return False, "", 0, 0, "in_range"
+
+    def evaluate_exit(self, position, prices, secs_to_close, context) -> Tuple[bool, str, int, str]:
         yes_bid = prices.get("best_yes_bid")
         no_bid = prices.get("best_no_bid")
         yes_ask = prices.get("imp_yes_ask")
-        
+
         if not yes_bid:
             return False, "", 0, "no_bid"
-        
+
         mid = (yes_bid + (yes_ask or yes_bid)) / 2
         mean, std = self._calc_stats()
-        
+
         if position.side == "yes":
             pnl = yes_bid - position.entry_price
-            
-            # Reverted to mean
             if mid >= mean - 2:
-                return True, "take_profit", yes_bid - 1, f"reverted:{pnl:.0f}¢"
-            
+                return True, "take_profit", int(yes_bid) - 1, f"reverted:{pnl:.0f}c"
             if pnl <= -self.params["stop_loss"]:
-                return True, "stop", yes_bid - 1, f"stop:{pnl:.0f}¢"
-        
+                return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
         else:
             if no_bid:
                 pnl = no_bid - position.entry_price
-                
                 if mid <= mean + 2:
-                    return True, "take_profit", no_bid - 1, f"reverted:{pnl:.0f}¢"
-                
+                    return True, "take_profit", int(no_bid) - 1, f"reverted:{pnl:.0f}c"
                 if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", no_bid - 1, f"stop:{pnl:.0f}¢"
-        
+                    return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
+
+        return False, "", 0, "hold"
+    
+# =============================================================================
+# STRATEGY 3: PREGAME ANCHORED + LIVE MANAGEMENT (partner test)
+# =============================================================================
+
+class PregameAnchoredStrategy(BaseStrategy):
+    """
+    Partner test strategy:
+      - Place ONE pregame limit entry within the last ~5 minutes before tip,
+        improving the market ask by a cushion (5-6c).
+      - If filled, manage live with:
+          1) lock ASAP when profitable,
+          2) take profit at +10-15c,
+          3) exit with 10 minutes remaining if still open,
+          4) cut at -15 to -20c.
+
+    Fair (pregame) is a blend of:
+      - market midpoint (default 70%)
+      - two models (default 30%), internally split between our model and partner.
+    """
+
+    def __init__(
+        self,
+        max_capital: float,
+        model_fair_cents: int,
+        partner_fair_cents: int,
+        cushion_cents: int = 6,
+        market_weight: float = 0.70,
+        model_share: float = 0.50,
+    ):
+        params = {
+            "min_entry_edge": 8,              # pregame: require a real mismatch
+            "min_lock_profit": 10,
+            "stop_loss": 18,
+            "take_profit": 15,
+            "exit_with_secs_remaining": 600,  # 10 minutes
+            "pregame_window_secs": 300,       # 5 minutes
+            "max_positions": 1,
+            "min_entry_gap_secs": 999999,     # we handle re-tries ourselves
+            "side_cooldown_secs": 0,
+            "stop_trading_before_close_secs": 0,  # allow entry pregame even though "close" is far
+            "max_lock_attempts": 2,
+        }
+        super().__init__("pregame_anchored", max_capital, params)
+        self.model_fair = int(model_fair_cents)
+        self.partner_fair = int(partner_fair_cents)
+        self.cushion_cents = int(cushion_cents)
+        self.market_weight = float(market_weight)
+        self.model_share = float(model_share)
+
+        # State: only attempt ONE pregame order; if it doesn't fill, we skip the game.
+        self._pregame_attempted = False
+        self._pregame_failed = False
+
+    # --- BaseStrategy hooks ---
+
+    def entry_wait_secs(self, context: Dict[str, Any]) -> int:
+        """Wait up to tip (<=5m window) so the limit rests and can fill."""
+        secs_to_tip = context.get("secs_to_tip")
+        if isinstance(secs_to_tip, (int, float)):
+            window = int(self.params.get("pregame_window_secs", 300))
+            if 0 < secs_to_tip <= window:
+                return max(15, int(secs_to_tip))
+        return 15
+
+    def on_entry_result(self, filled: bool, context: Dict[str, Any]) -> None:
+        # If our single pregame attempt doesn't fill, do not keep chasing.
+        if self._pregame_attempted and not filled:
+            self._pregame_failed = True
+
+    # --- Internal helpers ---
+
+    def _pregame_fair_yes(self, market_mid: float) -> float:
+        models_weight = 1.0 - self.market_weight
+        model_mix = self.model_share * float(self.model_fair) + (1.0 - self.model_share) * float(self.partner_fair)
+        return self.market_weight * float(market_mid) + models_weight * model_mix
+
+    def _improved_limit(self, bid: Optional[int], ask: Optional[int]) -> Optional[int]:
+        if ask is None:
+            return None
+        # target = ask - cushion, but ensure we improve the bid by at least 1 tick if bid exists
+        target = int(round(ask - self.cushion_cents))
+        if bid is not None:
+            target = max(target, int(bid) + 1)
+        target = min(target, int(ask) - 1)
+        if target < 1 or target > 99:
+            return None
+        return target
+
+    # --- Strategy interface ---
+
+    def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
+        if self._pregame_failed:
+            return False, "", 0, 0, "pregame_failed"
+        if self.positions:
+            return False, "", 0, 0, "already_in"
+        if self._pregame_attempted:
+            return False, "", 0, 0, "pregame_attempted"
+
+        secs_to_tip = context.get("secs_to_tip")
+        window = int(self.params.get("pregame_window_secs", 300))
+        if not isinstance(secs_to_tip, (int, float)):
+            return False, "", 0, 0, "no_secs_to_tip"
+        if not (0 < secs_to_tip <= window):
+            return False, "", 0, 0, f"not_in_window:{int(secs_to_tip)}s"
+
+        yes_bid = prices.get("best_yes_bid")
+        yes_ask = prices.get("imp_yes_ask")
+        no_bid = prices.get("best_no_bid")
+        no_ask = prices.get("imp_no_ask")
+
+        if yes_bid is None or yes_ask is None:
+            return False, "", 0, 0, "no_yes_prices"
+
+        mid = (yes_bid + yes_ask) / 2
+        fair_yes = self._pregame_fair_yes(mid)
+
+        min_edge = int(self.params.get("min_entry_edge", 8))
+
+        # Decide side based on fair vs market
+        side = ""
+        if fair_yes >= mid + min_edge:
+            side = "yes"
+            px = self._improved_limit(yes_bid, yes_ask)
+        elif fair_yes <= mid - min_edge:
+            side = "no"
+            px = self._improved_limit(no_bid, no_ask)
+        else:
+            return False, "", 0, 0, f"no_edge:fair={fair_yes:.1f},mid={mid:.1f}"
+
+        if not side or px is None:
+            return False, "", 0, 0, "no_price_after_improve"
+
+        self._pregame_attempted = True
+        return True, side, int(px), 1, f"pregame:fair={fair_yes:.1f} mid={mid:.1f} tip={int(secs_to_tip)}s"
+
+    def evaluate_exit(self, position, prices, secs_to_close, context) -> Tuple[bool, str, int, str]:
+        yes_bid = prices.get("best_yes_bid")
+        no_bid = prices.get("best_no_bid")
+        no_ask = prices.get("imp_no_ask")
+        yes_ask = prices.get("imp_yes_ask")
+
+        # 3) time-based exit with 10 minutes remaining
+        exit_with = int(self.params.get("exit_with_secs_remaining", 600))
+        if secs_to_close <= exit_with:
+            if position.side == "yes" and yes_bid is not None:
+                return True, "timeout", int(yes_bid) - 1, f"time_exit:{int(secs_to_close)}s"
+            if position.side == "no" and no_bid is not None:
+                return True, "timeout", int(no_bid) - 1, f"time_exit:{int(secs_to_close)}s"
+
+        # 1) lock ASAP if profitable
+        if position.side == "yes":
+            if no_ask is not None and position.lock_attempts < self.params["max_lock_attempts"]:
+                profit = 100 - position.entry_price - no_ask
+                if profit >= self.params["min_lock_profit"]:
+                    position.lock_attempts += 1
+                    return True, "lock", int(no_ask), f"lock:{profit:.0f}c"
+
+            # 2/4) take profit / stop
+            if yes_bid is not None:
+                pnl = yes_bid - position.entry_price
+                if pnl >= self.params["take_profit"]:
+                    return True, "take_profit", int(yes_bid) - 1, f"tp:{pnl:.0f}c"
+                if pnl <= -self.params["stop_loss"]:
+                    return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
+
+        else:
+            if yes_ask is not None and position.lock_attempts < self.params["max_lock_attempts"]:
+                profit = 100 - position.entry_price - yes_ask
+                if profit >= self.params["min_lock_profit"]:
+                    position.lock_attempts += 1
+                    return True, "lock", int(yes_ask), f"lock:{profit:.0f}c"
+
+            if no_bid is not None:
+                pnl = no_bid - position.entry_price
+                if pnl >= self.params["take_profit"]:
+                    return True, "take_profit", int(no_bid) - 1, f"tp:{pnl:.0f}c"
+                if pnl <= -self.params["stop_loss"]:
+                    return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
+
         return False, "", 0, "hold"
 
 
+
+# =============================================================================
+# STRATEGY 3: SPREAD CAPTURE
+# =============================================================================
+
 class SpreadCaptureStrategy(BaseStrategy):
-    """Spread capture / market making lite"""
-    
+    """Profit from wide spreads. Largely unchanged — wasn't the problem."""
+
     def __init__(self, max_capital: float):
         params = {
             "min_spread": 6,
@@ -860,271 +904,73 @@ class SpreadCaptureStrategy(BaseStrategy):
             "stop_loss": 12,
             "max_positions": 2,
             "min_entry_gap_secs": 60,
+            "side_cooldown_secs": 90,
+            "stop_trading_before_close_secs": 300,
+            "max_lock_attempts": 2,
         }
         super().__init__("spread_capture", max_capital, params)
-    
-    def evaluate_entry(
-        self,
-        prices: Dict[str, Any],
-        game_context: Dict[str, Any]
-    ) -> Tuple[bool, str, int, int, str, float]:
+
+    def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
         yes_bid = prices.get("best_yes_bid")
         yes_ask = prices.get("imp_yes_ask")
         no_bid = prices.get("best_no_bid")
-        
+
         if not all([yes_bid, yes_ask, no_bid]):
-            return False, "", 0, 0, "no_prices", 0.0
-        
+            return False, "", 0, 0, "no_prices"
+
         spread = yes_ask - yes_bid
-        
         if spread < self.params["min_spread"]:
-            return False, "", 0, 0, f"spread:{spread}¢", 0.0
-        
-        # Try to improve YES bid
+            return False, "", 0, 0, f"spread:{spread}c"
+
         our_bid = yes_bid + self.params["improve_cents"]
-        
-        # FIXED: Correct lock calculation using imp_no_ask
-        imp_no_ask = 100 - yes_bid  # This is the price to lock NO
-        potential_lock_cost = our_bid + imp_no_ask
+        potential_lock_cost = our_bid + (100 - no_bid)
         potential_profit = 100 - potential_lock_cost
-        
+
         if potential_profit >= self.params["min_lock_profit"]:
-            qty = self._size_position(potential_profit, our_bid, "yes")
-            if qty > 0:
-                return True, "yes", our_bid, qty, \
-                    f"spread:{spread}¢,pot_lock:{potential_profit:.0f}¢", potential_profit
-        
-        return False, "", 0, 0, "no_opportunity", 0.0
-    
-    def evaluate_exit(
-        self,
-        position: Position,
-        prices: Dict[str, Any],
-        game_context: Dict[str, Any]
-    ) -> Tuple[bool, str, int, str]:
+            return True, "yes", our_bid, 1, f"spread:{spread}c,pot:{potential_profit:.0f}c"
+
+        return False, "", 0, 0, "no_opp"
+
+    def evaluate_exit(self, position, prices, secs_to_close, context) -> Tuple[bool, str, int, str]:
         yes_bid = prices.get("best_yes_bid")
-        no_bid = prices.get("best_no_bid")
-        yes_ask = prices.get("imp_yes_ask")
         no_ask = prices.get("imp_no_ask")
-        
+        yes_ask = prices.get("imp_yes_ask")
+        no_bid = prices.get("best_no_bid")
+
         if position.side == "yes":
-            # Try to lock (FIXED: use imp_no_ask)
-            if no_ask:
+            if no_ask and position.lock_attempts < self.params["max_lock_attempts"]:
                 profit = 100 - position.entry_price - no_ask
                 if profit >= self.params["min_lock_profit"]:
-                    return True, "lock", no_ask, f"lock:{profit:.0f}¢"
-            
-            # Stop loss
+                    position.lock_attempts += 1
+                    return True, "lock", int(no_ask), f"lock:{profit:.0f}c"
             if yes_bid:
                 pnl = yes_bid - position.entry_price
                 if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", yes_bid - 1, f"stop:{pnl:.0f}¢"
-        
+                    return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
         else:
-            # Try to lock (FIXED: use imp_yes_ask)
-            if yes_ask:
+            if yes_ask and position.lock_attempts < self.params["max_lock_attempts"]:
                 profit = 100 - position.entry_price - yes_ask
                 if profit >= self.params["min_lock_profit"]:
-                    return True, "lock", yes_ask, f"lock:{profit:.0f}¢"
-            
-            # Stop loss
+                    position.lock_attempts += 1
+                    return True, "lock", int(yes_ask), f"lock:{profit:.0f}c"
             if no_bid:
                 pnl = no_bid - position.entry_price
                 if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", no_bid - 1, f"stop:{pnl:.0f}¢"
-        
+                    return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
+
         return False, "", 0, "waiting"
 
-# Continue in next file...
-# production_multistrat_part2.py
-# Continuation: GameRunner, Logging, and Data Collection
 
 # =============================================================================
-# COMPREHENSIVE DATA LOGGER
+# GAME RUNNER (P3 market quality + P4 settlement-aware reporting)
 # =============================================================================
 
-class ComprehensiveLogger:
-    """Multi-file logging system for complete data capture"""
-    
-    def __init__(self, game_label: str, ticker: str):
-        self.game_label = game_label
-        self.ticker = ticker
-        
-        os.makedirs("logs", exist_ok=True)
-        os.makedirs("data", exist_ok=True)
-        
-        ts = utc_now().strftime("%Y%m%d_%H%M%S")
-        self.session_id = f"{game_label}_{ts}"
-        
-        # Multiple log files for different purposes
-        self.snapshots_path = f"logs/snapshots_{self.session_id}.csv"
-        self.trades_path = f"logs/trades_{self.session_id}.csv"
-        self.positions_path = f"logs/positions_{self.session_id}.csv"
-        self.events_path = f"logs/events_{self.session_id}.csv"
-        self.summary_path = f"logs/summary_{self.session_id}.json"
-        
-        self._init_snapshots()
-        self._init_trades()
-        self._init_positions()
-        self._init_events()
-        
-        self.tick_count = 0
-    
-    def _init_snapshots(self):
-        """Market snapshot log (every tick)"""
-        with open(self.snapshots_path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "timestamp", "tick", "ticker",
-                "yes_bid", "yes_ask", "yes_imp_ask",
-                "no_bid", "no_ask", "no_imp_ask",
-                "mid", "spread", 
-                "yes_depth_1", "yes_depth_2", "yes_depth_3",
-                "no_depth_1", "no_depth_2", "no_depth_3",
-                "secs_to_kalshi_close", "secs_to_game_end", "clock_source",
-            ])
-    
-    def _init_trades(self):
-        """Individual trade attempts and fills"""
-        with open(self.trades_path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "timestamp", "strategy", "action", "side", "price", "qty",
-                "filled_qty", "vwap", "fee_cents", "reason",
-                "order_id", "position_id", "liquidity_ok", "was_maker"
-            ])
-    
-    def _init_positions(self):
-        """Complete position lifecycle"""
-        with open(self.positions_path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "position_id", "strategy", "side",
-                "entry_time", "entry_price", "entry_qty", "entry_fee", "entry_edge", "entry_reason",
-                "exit_time", "exit_type", "exit_price", "exit_fee", "exit_reason",
-                "lock_price", "lock_side",
-                "gross_pnl", "net_pnl", "hold_secs",
-            ])
-    
-    def _init_events(self):
-        """Strategy decision events (entries, exits, skips)"""
-        with open(self.events_path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "timestamp", "tick", "strategy", "event_type", "decision",
-                "side", "price", "qty", "reason", "position_id"
-            ])
-    
-    def log_snapshot(
-        self,
-        prices: Dict[str, Any],
-        secs_to_kalshi: int,
-        game_secs: Optional[int],
-        clock_source: str
-    ):
-        """Log market snapshot"""
-        self.tick_count += 1
-        
-        yes_levels = prices.get("yes_levels", [])
-        no_levels = prices.get("no_levels", [])
-        
-        yes_depths = [q for p, q in yes_levels[:3]] + [0, 0, 0]
-        no_depths = [q for p, q in no_levels[:3]] + [0, 0, 0]
-        
-        yes_bid = prices.get("best_yes_bid", "")
-        yes_ask = prices.get("best_yes_ask", "")
-        yes_imp_ask = prices.get("imp_yes_ask", "")
-        no_bid = prices.get("best_no_bid", "")
-        no_ask = prices.get("best_no_ask", "")
-        no_imp_ask = prices.get("imp_no_ask", "")
-        
-        mid = ""
-        spread = ""
-        if yes_bid and yes_imp_ask:
-            mid = (yes_bid + yes_imp_ask) / 2
-            spread = yes_imp_ask - yes_bid
-        
-        with open(self.snapshots_path, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                utc_now().isoformat(), self.tick_count, self.ticker,
-                yes_bid, yes_ask, yes_imp_ask,
-                no_bid, no_ask, no_imp_ask,
-                f"{mid:.2f}" if mid else "", spread,
-                yes_depths[0], yes_depths[1], yes_depths[2],
-                no_depths[0], no_depths[1], no_depths[2],
-                secs_to_kalshi, game_secs or "", clock_source,
-            ])
-    
-    def log_trade_event(self, event: TradeEvent):
-        """Log individual trade attempt/fill"""
-        with open(self.trades_path, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                event.timestamp, event.strategy, event.action, event.side,
-                event.price, event.qty, event.filled_qty,
-                f"{event.vwap:.2f}" if event.vwap else "",
-                f"{event.fee_cents:.2f}",
-                event.reason, event.order_id, event.position_id,
-                event.liquidity_ok, event.was_maker_attempt,
-            ])
-    
-    def log_position(self, pos: ClosedPosition):
-        """Log completed position"""
-        with open(self.positions_path, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                pos.id, pos.strategy, pos.side,
-                pos.entry_time, f"{pos.entry_price:.2f}", pos.qty,
-                f"{pos.entry_fee:.2f}", f"{pos.entry_edge:.2f}", "",
-                pos.exit_time, pos.exit_type, f"{pos.exit_price:.2f}",
-                f"{pos.exit_fee:.2f}", pos.exit_reason,
-                f"{pos.lock_price:.2f}" if pos.lock_price else "",
-                pos.lock_side or "",
-                f"{pos.gross_pnl:.2f}", f"{pos.net_pnl:.2f}", pos.hold_secs,
-            ])
-    
-    def log_event(
-        self,
-        strategy: str,
-        event_type: str,
-        decision: str,
-        side: str = "",
-        price: int = 0,
-        qty: int = 0,
-        reason: str = "",
-        position_id: str = ""
-    ):
-        """Log strategy decision event"""
-        with open(self.events_path, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                utc_now().isoformat(), self.tick_count, strategy,
-                event_type, decision, side, price, qty, reason, position_id
-            ])
-    
-    def save_summary(self, summary: Dict[str, Any]):
-        """Save final summary as JSON"""
-        with open(self.summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
-    
-    def get_paths(self) -> Dict[str, str]:
-        """Return all log file paths"""
-        return {
-            "snapshots": self.snapshots_path,
-            "trades": self.trades_path,
-            "positions": self.positions_path,
-            "events": self.events_path,
-            "summary": self.summary_path,
-        }
+POLL_INTERVAL_SECS = 3.0
+STOP_TRADING_BEFORE_CLOSE_SECS = 300
 
-# =============================================================================
-# GAME RUNNER (WITH ESPN CLOCK)
-# =============================================================================
 
 class GameRunner:
-    """Runs multiple strategies on one game with full logging"""
-    
+
     def __init__(
         self,
         game_label: str,
@@ -1132,111 +978,269 @@ class GameRunner:
         market: Dict[str, Any],
         strategies: List[BaseStrategy],
         private_key,
-        espn_clock: Optional[EspnGameClock] = None,
+        espn_clock=None,
     ):
         self.label = game_label
         self.ticker = ticker
         self.market = market
         self.strategies = strategies
         self.private_key = private_key
-        self.espn_clock = espn_clock
-        
         self.close_time = parse_iso(market["close_time"])
-        self.executor = OrderExecutor(private_key, ticker, game_label)
-        self.logger = ComprehensiveLogger(game_label, ticker)
-        
-        self.start_time = utc_now()
-        self.last_status_tick = 0
-    
-    def _get_game_context(self) -> Dict[str, Any]:
-        """Build game context including real-time clock info"""
+        self.espn_clock = espn_clock
+
+        # P3: Market quality monitor
+        self.quality = MarketQualityMonitor(warmup_samples=40, warmup_secs=180)
+        self._market_killed = False
+        self._market_kill_reason = ""
+
+        # Logging
+        os.makedirs("logs", exist_ok=True)
+        ts = utc_now().strftime("%Y%m%d_%H%M%S")
+        base = f"logs/multistrat_{game_label}_{ts}"
+        self.snapshot_path = f"{base}_snapshots.csv"
+        self.trade_path = f"{base}_trades.csv"
+        self.position_path = f"{base}_positions.csv"
+        self.event_path = f"{base}_events.csv"
+        self._init_logs()
+        self.snapshots = 0
+
+    def _init_logs(self):
+        with open(self.snapshot_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "timestamp", "ticker", "secs_to_close", "clock_source",
+                "yes_bid", "yes_ask", "no_bid", "no_ask", "mid", "spread",
+                "mq_std", "mq_tradeable","espn_live_win_pct", "game_progress", "secs_to_tip",
+            ])
+        with open(self.trade_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "timestamp", "ticker", "strategy", "action", "side",
+                "intended_price", "fill_price", "qty", "fee_cents",
+                "reason", "order_id",
+            ])
+        with open(self.position_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "position_id", "strategy", "side",
+                "entry_price", "entry_time", "entry_fee",
+                "exit_price", "exit_time", "exit_type", "exit_fee",
+                "lock_price", "gross_pnl", "net_pnl", "hold_secs",
+            ])
+        with open(self.event_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "timestamp", "strategy", "event", "detail",
+            ])
+
+    def _log_snapshot(self, prices, secs_to_close, clock_source, mq_std, mq_ok, espn_wp, game_progress, secs_to_tip):
+
+        yes_bid = prices.get("best_yes_bid", "")
+        yes_ask = prices.get("imp_yes_ask", "")
+        no_bid = prices.get("best_no_bid", "")
+        no_ask = prices.get("imp_no_ask", "")
+        mid = ""
+        spread = ""
+        if yes_bid and yes_ask:
+            mid = f"{(yes_bid + yes_ask) / 2:.1f}"
+            spread = yes_ask - yes_bid
+        with open(self.snapshot_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                utc_now().isoformat(), self.ticker, int(secs_to_close), clock_source,
+                yes_bid, yes_ask, no_bid, no_ask, mid, spread,
+                f"{mq_std:.1f}", mq_ok,
+                espn_wp if espn_wp is not None else "",
+                game_progress if game_progress is not None else "",
+                secs_to_tip if secs_to_tip is not None else "",
+            ])
+
+
+    def _log_trade(self, strategy, action, side, intended, fill, qty, fee, reason, oid=""):
+        with open(self.trade_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                utc_now().isoformat(), self.ticker, strategy, action, side,
+                intended, f"{fill:.1f}" if fill else "", qty, f"{fee:.2f}",
+                reason, oid,
+            ])
+
+    def _log_position(self, closed: ClosedPosition):
+        with open(self.position_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                closed.id, closed.strategy, closed.side,
+                closed.entry_price, closed.entry_time, f"{closed.entry_fee:.2f}",
+                closed.exit_price, closed.exit_time, closed.exit_type, f"{closed.exit_fee:.2f}",
+                closed.lock_price or "", f"{closed.gross_pnl:.1f}", f"{closed.net_pnl:.1f}",
+                closed.hold_secs,
+            ])
+
+    def _log_event(self, strategy, event, detail=""):
+        with open(self.event_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([utc_now().isoformat(), strategy, event, detail])
+
+    # --- Execution helpers ---
+
+    def _execute_entry(self, strategy: BaseStrategy, side: str, price: int, qty: int, reason: str,
+                    context: Dict[str, Any]):
+
+        print_status(f"[{self.label}][{strategy.name}] ENTRY {side.upper()} {qty}x @ {price}c — {reason}")
+        self._log_event(strategy.name, "entry_attempt", f"{side} {qty}x@{price}c {reason}")
+
+        try:
+            # Liquidity check before sending order
+            ob = fetch_orderbook(self.ticker)
+            px = derive_prices(ob)
+            if not has_fill_liquidity_for_implied_buy(px, side, price, min_qty=max(MIN_LIQUIDITY_CONTRACTS, qty)):
+                print_status(f"[{self.label}][{strategy.name}] SKIP — no liquidity for {side} @{price}c")
+                self._log_event(strategy.name, "entry_skip_liquidity", f"{side}@{price}c")
+                return None
+
+            order_id = place_limit_buy(self.private_key, self.ticker, side, price, qty)
+            wait_secs = int(strategy.entry_wait_secs(context) or 15)
+            filled, vwap = wait_for_fill_or_timeout(self.private_key, order_id, side, max_wait_secs=wait_secs)
+
+
+            if filled > 0:
+                actual = vwap if vwap else float(price)
+                pos = strategy.record_entry(side, actual, filled, reason)
+                fee = calc_taker_fee(int(actual), filled)
+                print_status(f"[{self.label}][{strategy.name}] FILLED {filled}x @ {actual:.1f}c")
+                strategy.on_entry_result(True, context)
+                self._log_trade(strategy.name, "entry_fill", side, price, actual, filled, fee, reason, order_id)
+                return pos
+            else:
+                print_status(f"[{self.label}][{strategy.name}] NO FILL")
+                strategy.on_entry_result(False, context)
+                self._log_trade(strategy.name, "entry_nofill", side, price, 0, 0, 0, reason, order_id)
+                return None
+
+        except Exception as e:
+            print_status(f"[{self.label}][{strategy.name}] ENTRY ERROR: {e}")
+            self._log_event(strategy.name, "entry_error", str(e))
+            return None
+
+    def _execute_exit(self, strategy: BaseStrategy, position: Position,
+                      exit_type: str, price: int, reason: str):
+        print_status(f"[{self.label}][{strategy.name}] EXIT {position.side.upper()} @ {price}c — {reason}")
+        self._log_event(strategy.name, f"exit_{exit_type}_attempt", f"{position.side}@{price}c {reason}")
+
+        lock_price = None
+        try:
+            if exit_type == "lock":
+                lock_side = "no" if position.side == "yes" else "yes"
+                order_id = place_limit_buy(self.private_key, self.ticker, lock_side, price, position.qty)
+                filled, vwap = wait_for_fill_or_timeout(self.private_key, order_id, lock_side, max_wait_secs=15)
+                if filled > 0:
+                    lock_price = vwap if vwap else float(price)
+                    actual_exit = lock_price
+                else:
+                    print_status(f"[{self.label}][{strategy.name}] LOCK NO FILL")
+                    self._log_event(strategy.name, "lock_nofill", f"{lock_side}@{price}c")
+                    return None
+            else:
+                order_id = place_limit_sell(self.private_key, self.ticker, position.side, price, position.qty)
+                filled, vwap = wait_for_fill_or_timeout(self.private_key, order_id, position.side, max_wait_secs=15)
+                if filled > 0:
+                    actual_exit = vwap if vwap else float(price)
+                else:
+                    print_status(f"[{self.label}][{strategy.name}] EXIT NO FILL")
+                    self._log_event(strategy.name, "exit_nofill", f"{position.side}@{price}c")
+                    return None
+
+            closed = strategy.record_exit(position, exit_type, actual_exit, lock_price)
+            fee = calc_taker_fee(int(actual_exit), position.qty)
+            print_status(f"[{self.label}][{strategy.name}] CLOSED: net={closed.net_pnl:.1f}c")
+            self._log_trade(strategy.name, f"exit_{exit_type}", position.side, price,
+                           actual_exit, position.qty, fee, reason, order_id)
+            self._log_position(closed)
+            return closed
+
+        except Exception as e:
+            print_status(f"[{self.label}][{strategy.name}] EXIT ERROR: {e}")
+            self._log_event(strategy.name, "exit_error", str(e))
+            return None
+
+    # --- P4: Settlement-aware P&L ---
+
+    def _settlement_pnl_warning(self, prices: Dict[str, Any], secs_to_close: int):
+        """P4: Warn about open positions that will expire badly"""
+        if secs_to_close > 300:
+            return
+
+        for strategy in self.strategies:
+            for pos in strategy.positions:
+                # Estimate settlement value
+                mid = None
+                yes_bid = prices.get("best_yes_bid")
+                yes_ask = prices.get("imp_yes_ask")
+                if yes_bid and yes_ask:
+                    mid = (yes_bid + yes_ask) / 2
+
+                if mid is None:
+                    continue
+
+                # If YES side and market says <30¢, this position likely expires worthless
+                if pos.side == "yes" and mid < 30:
+                    potential_loss = pos.entry_price * pos.qty
+                    print_status(
+                        f"[{self.label}][{strategy.name}] ⚠ SETTLEMENT RISK: "
+                        f"{pos.side.upper()} @{pos.entry_price:.0f}c, market={mid:.0f}c, "
+                        f"potential loss={potential_loss:.0f}c if YES loses"
+                    )
+                    self._log_event(strategy.name, "settlement_warning",
+                                   f"{pos.side}@{pos.entry_price:.0f}c mid={mid:.0f}c")
+
+                if pos.side == "no" and mid > 70:
+                    potential_loss = pos.entry_price * pos.qty
+                    print_status(
+                        f"[{self.label}][{strategy.name}] ⚠ SETTLEMENT RISK: "
+                        f"{pos.side.upper()} @{pos.entry_price:.0f}c, market={mid:.0f}c, "
+                        f"potential loss={potential_loss:.0f}c if NO loses"
+                    )
+                    self._log_event(strategy.name, "settlement_warning",
+                                   f"{pos.side}@{pos.entry_price:.0f}c mid={mid:.0f}c")
+
+    # --- Main loop ---
+
+    def _get_secs_to_close(self) -> Tuple[float, str, Optional[float], Optional[float], Optional[int]]:
+        """
+        Returns:
+        (secs_to_close, clock_source, espn_live_win_pct, game_progress, secs_to_tip)
+        """
         now = utc_now()
         kalshi_secs = (self.close_time - now).total_seconds()
-        
-        game_secs = None
-        clock_source = "kalshi_only"
-        
+
+        espn_wp = None
+        game_progress = None
+        secs_to_tip = None
+
         if self.espn_clock:
             try:
-                game_secs, status = self.espn_clock.get_secs_to_game_end()
+                ctx = self.espn_clock.get_live_context()
+                espn_wp = ctx.get("espn_live_win_pct")
+                game_progress = ctx.get("game_progress")
+                secs_to_tip = ctx.get("secs_to_tip")
+
+                game_secs = ctx.get("secs_to_game_end")
+                why = ctx.get("why", "espn")
+
                 if game_secs is not None:
-                    clock_source = f"espn:{status}"
-            except Exception as e:
-                print_status(f"[{self.label}] ESPN clock error: {e}")
-        
-        # ESPN is source of truth when available
-        if game_secs is not None:
-            secs_to_close = float(game_secs)
-            is_espn_final = (game_secs == 0 and "final" in status.lower())
-        else:
-            secs_to_close = kalshi_secs
-            is_espn_final = False
-        
-           
-        
-        return {
-            "secs_to_close": int(secs_to_close),
-            "kalshi_secs_remaining": int(kalshi_secs),
-            "game_secs_remaining": game_secs,
-            "clock_source": clock_source,
-            "is_espn_final": is_espn_final,
-        }
-    
-    def _print_status(self, prices: Dict[str, Any], context: Dict[str, Any]):
-        """Print periodic status update"""
-        yes_bid = prices.get("best_yes_bid", "?")
-        yes_ask = prices.get("imp_yes_ask", "?")
-        no_bid = prices.get("best_no_bid", "?")
-        no_ask = prices.get("imp_no_ask", "?")
-        
-        open_count = sum(len(s.positions) for s in self.strategies)
-        total_net_pnl = sum(s.get_stats()["net_pnl"] for s in self.strategies)
-        
-        clock_info = f"K:{context['kalshi_secs_remaining']}"
-        if context['game_secs_remaining']:
-            clock_info += f"|G:{context['game_secs_remaining']}"
-        
-        print_status(
-            f"[{self.label}] YES:{yes_bid}/{yes_ask} NO:{no_bid}/{no_ask} | "
-            f"Open:{open_count} | NetPnL:{total_net_pnl:.1f}¢ | "
-            f"Clocks:{clock_info} | Src:{context['clock_source']}"
-        )
-    
+                    return min(kalshi_secs, float(game_secs)), f"espn:{why}", espn_wp, game_progress, secs_to_tip
+
+                # pregame: we still return kalshi_secs (placeholder), but expose secs_to_tip
+                return kalshi_secs, f"espn:{why}", espn_wp, game_progress, secs_to_tip
+
+            except Exception:
+                pass
+
+        return kalshi_secs, "kalshi", espn_wp, game_progress, secs_to_tip
+
     def run(self) -> Dict[str, Any]:
-        """Main trading loop"""
-        print_status(f"\n{'='*70}")
-        print_status(f"[{self.label}] STARTING")
-        print_status(f"  Ticker: {self.ticker}")
-        print_status(f"  Market: {self.market.get('title', 'N/A')}")
-        print_status(f"  Close: {self.close_time}")
-        print_status(f"  Strategies: {[s.name for s in self.strategies]}")
-        if self.espn_clock:
-            print_status(f"  ESPN Clock: ENABLED")
-        print_status(f"{'='*70}\n")
-        
+        print_status(f"[{self.label}] Starting — Strategies: {[s.name for s in self.strategies]}")
+        print_status(f"[{self.label}] Close: {self.close_time}")
+
         while True:
-            context = self._get_game_context()
-            
-            # Check if we should stop
-            if context.get("is_espn_final", False):
-                print_status(f"[{self.label}] Game final per ESPN - stopping")
-                self._close_all_positions()
+            secs_to_close, clock_source, espn_wp, game_progress, secs_to_tip = self._get_secs_to_close()
+
+            if secs_to_close <= 0:
+                print_status(f"[{self.label}] Market closed")
                 break
-            
-            if context["secs_to_close"] <= 0:
-                print_status(f"[{self.label}] Market closed (time)")
-                break
-            
-            # if context["secs_to_close"] <= STOP_TRADING_BEFORE_CLOSE_SECS:
-            #     print_status(
-            #         f"[{self.label}] Near close ({context['secs_to_close']}s) - "
-            #         f"stopping new trades"
-            #     )
-            #     # Close any remaining positions
-            #     self._close_all_positions()
-            #     break
-            
-            # Fetch orderbook
+
             try:
                 ob = fetch_orderbook(self.ticker)
                 prices = derive_prices(ob)
@@ -1244,212 +1248,98 @@ class GameRunner:
                 print_status(f"[{self.label}] Orderbook error: {e}")
                 time.sleep(POLL_INTERVAL_SECS)
                 continue
-            
-            # Log snapshot
-            self.logger.log_snapshot(
-                prices,
-                context["kalshi_secs_remaining"],
-                context["game_secs_remaining"],
-                context["clock_source"]
-            )
-            
-            # Status every 20 ticks (~1 minute)
-            if self.logger.tick_count - self.last_status_tick >= 20:
-                self._print_status(prices, context)
-                self.last_status_tick = self.logger.tick_count
-            
-            # Process each strategy
-            for strategy in self.strategies:
-                self._process_strategy(strategy, prices, context)
-            
-            # Add jitter to avoid synchronized API calls
-            import random
-            jitter = random.uniform(0, 0.7)
-            time.sleep(POLL_INTERVAL_SECS + jitter)
-        
-        # Final summary
-        return self._generate_summary()
-    
-    def _process_strategy(
-        self,
-        strategy: BaseStrategy,
-        prices: Dict[str, Any],
-        context: Dict[str, Any]
-    ):
-        """Process one strategy's decisions"""
-        
-        # Check exits first
-        for pos in list(strategy.positions):
-            should_exit, exit_type, exit_price, reason = strategy.evaluate_exit(
-                pos, prices, context
-            )
-            
-            if should_exit:
-                self.logger.log_event(
-                    strategy.name, "exit_eval", "yes",
-                    pos.side, exit_price, pos.qty, reason, pos.id
-                )
-                
-                filled, vwap, fee, lock_price, lock_side = self.executor.execute_exit(
-                    strategy.name, pos, exit_type, exit_price, reason, prices
-                )
-                
-                if filled > 0:
-                    actual_exit_price = vwap if vwap else float(exit_price)
-                    closed = strategy.record_exit(
-                        pos, exit_type, actual_exit_price, fee,
-                        reason, lock_price, lock_side
-                    )
-                    self.logger.log_position(closed)
-                    
-                    print_status(
-                        f"[{self.label}][{strategy.name}] CLOSED {pos.id}: "
-                        f"{closed.exit_type} | Net: {closed.net_pnl:.1f}¢"
-                    )
+
+            self.snapshots += 1
+
+            # Compute midpoint and spread for quality monitor
+            yes_bid = prices.get("best_yes_bid")
+            yes_ask = prices.get("imp_yes_ask")
+            mid = None
+            spread = None
+            if yes_bid is not None and yes_ask is not None:
+                mid = (yes_bid + yes_ask) / 2
+                spread = yes_ask - yes_bid
+
+            # P3: Update quality monitor
+            self.quality.update(mid, spread)
+            mq_std = self.quality.recent_volatility()
+
+            # P3: Check if market is tradeable
+            if not self._market_killed:
+                mq_ok, mq_reason = self.quality.is_tradeable()
             else:
-                if self.logger.tick_count % 60 == 0:  # Log holds occasionally
-                    self.logger.log_event(
-                        strategy.name, "exit_eval", "hold",
-                        pos.side, 0, pos.qty, reason, pos.id
-                    )
-        
-        # Check entry
-        can_enter, throttle_reason = strategy.can_enter()
-        
-        if not can_enter:
-            if self.logger.tick_count % 60 == 0:
-                self.logger.log_event(
-                    strategy.name, "entry_eval", "throttled",
-                    "", 0, 0, throttle_reason
-                )
-            return
-        
-        should_enter, side, price, qty, reason, edge = strategy.evaluate_entry(
-            prices, context
-        )
-        
-        if should_enter:
-            position_id = f"{strategy.name}_{strategy.position_counter + 1}"
-            
-            self.logger.log_event(
-                strategy.name, "entry_eval", "yes",
-                side, price, qty, reason, position_id
-            )
-            
-            filled, vwap, fee = self.executor.execute_entry(
-                strategy.name, side, price, qty, prices, reason, position_id
-            )
-            
-            if filled > 0:
-                actual_price = vwap if vwap else float(price)
-                pos = strategy.record_entry(
-                    side, actual_price, filled, reason, fee, edge
-                )
-                
+                mq_ok = False
+                mq_reason = self._market_kill_reason
+
+            self._log_snapshot(prices, secs_to_close, clock_source, mq_std, mq_ok, espn_wp, game_progress, secs_to_tip)
+
+
+            # Status every 30 ticks
+            if self.snapshots % 30 == 0:
+                open_count = sum(len(s.positions) for s in self.strategies)
                 print_status(
-                    f"[{self.label}][{strategy.name}] OPENED {pos.id}: "
-                    f"{side.upper()} {filled}x @{actual_price:.2f}¢ | "
-                    f"Edge: {edge:.1f}¢"
+                    f"[{self.label}] Y:{yes_bid}/{yes_ask} | "
+                    f"secs:{int(secs_to_close)} src:{clock_source} | "
+                    f"open:{open_count} | mq:{mq_reason}"
                 )
-        else:
-            if self.logger.tick_count % 60 == 0:
-                self.logger.log_event(
-                    strategy.name, "entry_eval", "no",
-                    "", 0, 0, reason
-                )
-    
-    def _close_all_positions(self):
-        """Emergency close all open positions"""
-        print_status(f"[{self.label}] Closing all open positions...")
-        
-        try:
-            ob = fetch_orderbook(self.ticker)
-            prices = derive_prices(ob)
-        except:
-            print_status(f"[{self.label}] Cannot fetch prices for emergency close")
-            return
-        
-        for strategy in self.strategies:
-            for pos in list(strategy.positions):
-                yes_bid = prices.get("best_yes_bid")
-                no_bid = prices.get("best_no_bid")
-                
-                if pos.side == "yes" and yes_bid:
-                    exit_price = max(1, yes_bid - 2)
-                elif pos.side == "no" and no_bid:
-                    exit_price = max(1, no_bid - 2)
-                else:
-                    continue
-                
-                filled, vwap, fee, _, _ = self.executor.execute_exit(
-                    strategy.name, pos, "timeout", exit_price,
-                    "market_closing", prices
-                )
-                
-                if filled > 0:
-                    actual_price = vwap if vwap else float(exit_price)
-                    closed = strategy.record_exit(
-                        pos, "timeout", actual_price, fee, "market_closing"
+
+            # P4: Settlement warnings near close
+            self._settlement_pnl_warning(prices, int(secs_to_close))
+
+            context = {
+                "secs_to_close": secs_to_close,
+                "market_quality_ok": mq_ok,
+                "espn_live_win_pct": espn_wp,     # 0..1 or None
+                "game_progress": game_progress,  # 0..1 or None
+                "secs_to_tip": secs_to_tip,      # int seconds or None
+            }
+
+
+            for strategy in self.strategies:
+                # --- Exits first (always allowed, even in dead markets) ---
+                for pos in list(strategy.positions):
+                    should_exit, exit_type, exit_price, reason = strategy.evaluate_exit(
+                        pos, prices, int(secs_to_close), context
                     )
-                    self.logger.log_position(closed)
-    
-    def _generate_summary(self) -> Dict[str, Any]:
-        """Generate final summary"""
-        print_status(f"\n{'='*70}")
-        print_status(f"[{self.label}] FINAL SUMMARY")
-        print_status(f"{'='*70}")
-        
-        strategy_results = {}
-        
+                    if should_exit:
+                        self._execute_exit(strategy, pos, exit_type, exit_price, reason)
+
+                # --- Entries (only in tradeable markets) ---
+                if not mq_ok:
+                    continue  # P3: skip entries in dead/illiquid markets
+
+                can_enter, _ = strategy.can_enter(secs_to_close=int(secs_to_close))
+                if can_enter:
+                    should_enter, side, price, qty, reason = strategy.evaluate_entry(
+                        prices, int(secs_to_close), context
+                    )
+                    if should_enter:
+                        self._execute_entry(strategy, side, price, qty, reason, context)
+
+
+            time.sleep(POLL_INTERVAL_SECS)
+
+        # --- Final summary ---
+        print_status(f"[{self.label}] === SUMMARY ===")
+        result = {"strategies": {}}
+
         for strategy in self.strategies:
             stats = strategy.get_stats()
-            strategy_results[strategy.name] = stats
-            
-            print_status(f"\n[{strategy.name}]")
-            print_status(f"  Trades: {stats['trades']} ({stats['wins']}W / {stats['losses']}L)")
-            print_status(f"  Win Rate: {stats['win_rate']:.1%}")
-            print_status(f"  Locks: {stats['locks']} ({stats['lock_rate']:.1%})")
-            print_status(f"  Stops: {stats['stops']}")
-            print_status(f"  Gross P&L: {stats['gross_pnl']:.1f}¢ (${stats['gross_pnl']/100:.2f})")
-            print_status(f"  Fees: {stats['fees']:.1f}¢ (${stats['fees']/100:.2f})")
-            print_status(f"  Net P&L: {stats['net_pnl']:.1f}¢ (${stats['net_pnl']/100:.2f})")
-            if stats['trades'] > 0:
-                print_status(f"  Avg Win: {stats['avg_win']:.1f}¢")
-                print_status(f"  Avg Loss: {stats['avg_loss']:.1f}¢")
-                print_status(f"  Avg Hold: {stats['avg_hold_secs']/60:.1f} min")
-        
-        # Log all trade events
-        for event in self.executor.trade_events:
-            self.logger.log_trade_event(event)
-        
-        summary = {
-            "game_label": self.label,
-            "ticker": self.ticker,
-            "market_title": self.market.get("title", ""),
-            "start_time": self.start_time.isoformat(),
-            "end_time": utc_now().isoformat(),
-            "duration_secs": int((utc_now() - self.start_time).total_seconds()),
-            "strategies": strategy_results,
-            "log_files": self.logger.get_paths(),
-        }
-        
-        self.logger.save_summary(summary)
-        
-        print_status(f"\nLog files:")
-        for name, path in self.logger.get_paths().items():
-            print_status(f"  {name}: {path}")
-        
-        print_status(f"{'='*70}\n")
-        
-        return summary
+            result["strategies"][strategy.name] = stats
+            print_status(
+                f"[{self.label}][{strategy.name}] "
+                f"Trades:{stats['trades']} "
+                f"W:{stats['wins']}/L:{stats['losses']} | "
+                f"Locks:{stats['locks']} Stops:{stats['stops']} | "
+                f"Net:{stats['net_pnl']:.1f}c (${stats['net_pnl']/100:.2f}) | "
+                f"Fees:{stats['fees']:.1f}c"
+            )
 
-# Export for use in other files
-__all__ = [
-    'BaseStrategy',
-    'ModelEdgeStrategy',
-    'MeanReversionStrategy',
-    'SpreadCaptureStrategy',
-    'GameRunner',
-    'OrderExecutor',
-    'ComprehensiveLogger',
-]
+        # Save summary JSON
+        ts = utc_now().strftime("%Y%m%d_%H%M%S")
+        summary_path = f"logs/summary_{self.label}_{ts}.json"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, default=str)
+        print_status(f"[{self.label}] Summary: {summary_path}")
+
+        return result

@@ -1,0 +1,2 @@
+created_time,ticker,order_id,action,side,count,yes_price,no_price,price,fee_cents,trade_id
+2026-02-06T00:19:00.814365Z,KXNCAAMBGAME-26FEB05TARLCBU-TARL,0a260a44-4cac-4600-8421-be885d499c0a,buy,yes,2,17,83,0.17,1.98,e267ff4d-be73-5b13-bb06-05e716fdb5d0

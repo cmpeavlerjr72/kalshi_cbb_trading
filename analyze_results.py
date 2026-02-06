@@ -10,24 +10,130 @@ import glob
 from datetime import datetime
 
 def find_latest_logs():
-    """Find the most recent log files"""
+    """Find the most recent log sessions.
+
+    Prefer summary_*.json if they exist. Otherwise fall back to positions_*.csv.
+    Returns a list of file paths.
+    """
     summaries = glob.glob("logs/summary_*.json")
-    if not summaries:
-        print("No summary files found in logs/")
+    if summaries:
+        summaries.sort(reverse=True)
+        return summaries
+
+    # Fallback: no summaries (likely crashed before save). Use positions logs.
+    positions = glob.glob("logs/positions_*.csv")
+    if not positions:
+        print("No summary files found, and no positions files found in logs/")
         return None
-    
-    # Sort by timestamp in filename
-    summaries.sort(reverse=True)
-    return summaries
+
+    positions.sort(reverse=True)
+    return positions
+
 
 def load_summary(filepath):
     """Load a summary JSON file"""
-    with open(filepath, 'r') as f:
+    with open(filepath, 'r', encoding="utf-8") as f:
         return json.load(f)
+    
+def _infer_log_paths_from_positions(positions_path: str):
+    """Given logs/positions_<session_id>.csv infer trades/events/snapshots paths."""
+    base = os.path.basename(positions_path)
+    if not base.startswith("positions_") or not base.endswith(".csv"):
+        return {}
+
+    session_id = base[len("positions_"):-len(".csv")]
+    return {
+        "positions": f"logs/positions_{session_id}.csv",
+        "trades": f"logs/trades_{session_id}.csv",
+        "events": f"logs/events_{session_id}.csv",
+        "snapshots": f"logs/snapshots_{session_id}.csv",
+        # summary path doesn't exist in this fallback mode
+    }
+
+def build_summary_from_positions(positions_path: str):
+    """Build a minimal summary dict from positions CSV so analysis can run."""
+    log_files = _infer_log_paths_from_positions(positions_path)
+
+    # Infer game label from session id prefix: "<game_label>_<YYYYMMDD_HHMMSS>"
+    session_id = os.path.basename(positions_path)[len("positions_"):-len(".csv")]
+    game_label = session_id
+    # try split on last timestamp pattern
+    parts = session_id.rsplit("_", 2)
+    if len(parts) == 3:
+        game_label = parts[0]
+
+    summary = {
+        "game_label": game_label,
+        "duration_secs": 0,
+        "strategies": {},
+        "log_files": log_files,
+    }
+
+    if not os.path.exists(positions_path):
+        return summary
+
+    df = pd.read_csv(positions_path)
+    if len(df) == 0:
+        return summary
+
+    # Ensure numeric
+    for col in ["gross_pnl", "net_pnl", "hold_secs", "entry_fee", "exit_fee"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    # Strategy aggregation
+    for strat, g in df.groupby("strategy"):
+        trades = len(g)
+        wins = int((g["net_pnl"] > 0).sum())
+        losses = int((g["net_pnl"] < 0).sum())
+        locks = int((g["exit_type"] == "lock").sum())
+        stops = int((g["exit_type"] == "stop").sum())
+
+        gross_pnl = float(g["gross_pnl"].sum())
+        fees = float((g["entry_fee"] + g["exit_fee"]).sum())
+        net_pnl = float(g["net_pnl"].sum())
+
+        avg_hold = float(g["hold_secs"].mean()) if trades else 0.0
+        avg_win = float(g.loc[g["net_pnl"] > 0, "net_pnl"].mean()) if wins else 0.0
+        avg_loss = float(g.loc[g["net_pnl"] < 0, "net_pnl"].mean()) if losses else 0.0
+
+        summary["strategies"][strat] = {
+            "strategy": strat,
+            "trades": trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / trades) if trades else 0.0,
+            "locks": locks,
+            "lock_rate": (locks / trades) if trades else 0.0,
+            "stops": stops,
+            "gross_pnl": gross_pnl,
+            "fees": fees,
+            "net_pnl": net_pnl,
+            "avg_hold_secs": avg_hold,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+        }
+
+    # Rough duration estimate from entry/exit times if present
+    if "entry_time" in df.columns and "exit_time" in df.columns:
+        try:
+            t0 = pd.to_datetime(df["entry_time"], errors="coerce").min()
+            t1 = pd.to_datetime(df["exit_time"], errors="coerce").max()
+            if pd.notna(t0) and pd.notna(t1):
+                summary["duration_secs"] = int((t1 - t0).total_seconds())
+        except Exception:
+            pass
+
+    return summary
+
 
 def analyze_game(summary_path):
     """Analyze results for one game"""
-    summary = load_summary(summary_path)
+    if summary_path.endswith(".json"):
+        summary = load_summary(summary_path)
+    else:
+        summary = build_summary_from_positions(summary_path)
+
     
     game_label = summary.get('game_label', 'Unknown')
     print(f"\n{'='*70}")
@@ -48,16 +154,26 @@ def analyze_game(summary_path):
     total_net = 0
     
     for strat_name, stats in strategies.items():
-        trades = stats.get('trades', 0)
-        wins = stats.get('wins', 0)
-        win_rate = stats.get('win_rate', 0)
-        locks = stats.get('locks', 0)
-        lock_rate = stats.get('lock_rate', 0)
-        net_pnl = stats.get('net_pnl', 0)
-        
+        trades = int(stats.get('trades', 0))
+        wins = int(stats.get('wins', 0))
+        win_rate = float(stats.get('win_rate', 0.0))
+        locks = int(stats.get('locks', 0))
+        lock_rate = float(stats.get('lock_rate', 0.0))
+        net_pnl = float(stats.get('net_pnl', 0.0))
+
         total_net += net_pnl
-        
-        print(f"{strat_name:<20} {trades:>7} {win_rate:>5.1%} {locks:>6} {lock_rate:>5.1%} {net_pnl:>9.1f}¢")
+
+        if trades == 0:
+            win_rate_str = "   — "
+            lock_rate_str = "   — "
+        else:
+            win_rate_str = f"{win_rate:>5.1%}"
+            lock_rate_str = f"{lock_rate:>5.1%}"
+
+        print(
+            f"{strat_name:<20} {trades:>7} {win_rate_str} {locks:>6} {lock_rate_str} {net_pnl:>9.1f}¢"
+        )
+
     
     print("-" * 70)
     print(f"{'TOTAL':<20} {' '*19} {' '*13} {total_net:>9.1f}¢")
@@ -66,18 +182,22 @@ def analyze_game(summary_path):
     print("\nDetailed Statistics:")
     for strat_name, stats in strategies.items():
         print(f"\n  {strat_name}:")
-        print(f"    Total Trades: {stats.get('trades', 0)}")
+        trades = int(stats.get('trades', 0))
+        print(f"    Total Trades: {trades}")
         print(f"    Wins/Losses: {stats.get('wins', 0)}W - {stats.get('losses', 0)}L")
-        print(f"    Locks: {stats.get('locks', 0)} ({stats.get('lock_rate', 0):.1%})")
+        print(f"    Locks: {stats.get('locks', 0)} ({float(stats.get('lock_rate', 0.0)):.1%})")
         print(f"    Stops: {stats.get('stops', 0)}")
-        print(f"    Gross P&L: {stats.get('gross_pnl', 0):.1f}¢")
-        print(f"    Fees Paid: {stats.get('fees', 0):.1f}¢")
-        print(f"    Net P&L: {stats.get('net_pnl', 0):.1f}¢")
-        
-        if stats.get('trades', 0) > 0:
-            print(f"    Avg Win: {stats.get('avg_win', 0):.1f}¢")
-            print(f"    Avg Loss: {stats.get('avg_loss', 0):.1f}¢")
-            print(f"    Avg Hold: {stats.get('avg_hold_secs', 0)/60:.1f} min")
+        print(f"    Gross P&L: {float(stats.get('gross_pnl', 0.0)):.1f}¢")
+        print(f"    Fees Paid: {float(stats.get('fees', 0.0)):.1f}¢")
+        print(f"    Net P&L: {float(stats.get('net_pnl', 0.0)):.1f}¢")
+
+        if trades == 0:
+            print("    Note: NO TRADES (no averages computed)")
+        else:
+            print(f"    Avg Win: {float(stats.get('avg_win', 0.0)):.1f}¢")
+            print(f"    Avg Loss: {float(stats.get('avg_loss', 0.0)):.1f}¢")
+            print(f"    Avg Hold: {float(stats.get('avg_hold_secs', 0.0))/60:.1f} min")
+
     
     # Load detailed position data if available
     positions_file = summary.get('log_files', {}).get('positions')
@@ -174,10 +294,15 @@ def main():
         total_portfolio_pnl += game_pnl
         
         # Also analyze trades if available
-        summary = load_summary(summary_path)
+        if summary_path.endswith(".json"):
+            summary = load_summary(summary_path)
+        else:
+            summary = build_summary_from_positions(summary_path)
+
         trades_file = summary.get('log_files', {}).get('trades')
         if trades_file and os.path.exists(trades_file):
             analyze_trades(trades_file)
+
     
     # Portfolio summary
     print("\n" + "="*70)

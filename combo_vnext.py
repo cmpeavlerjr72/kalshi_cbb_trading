@@ -27,6 +27,9 @@ import threading
 
 load_dotenv()
 
+_PRINT_LOCK = threading.Lock()
+
+
 ENV = (os.getenv("KALSHI_ENV") or "DEMO").upper()  # DEMO or PROD
 BASE_URL = "https://demo-api.kalshi.co" if ENV == "DEMO" else "https://api.elections.kalshi.com"
 
@@ -170,18 +173,19 @@ def parse_iso(s: str) -> dt.datetime:
 def print_status(msg: str) -> None:
     ts = utc_now().strftime("%Y-%m-%d %H:%M:%S")
     thread_name = threading.current_thread().name
-    # Don't bother tagging the main CLI; only worker threads.
     if thread_name and thread_name != "MainThread":
         prefix = f"[{thread_name}] "
     else:
         prefix = ""
-    print(f"[{ts}] {prefix}{msg}", flush=True)
+    with _PRINT_LOCK:
+        print(f"[{ts}] {prefix}{msg}", flush=True)
+
 
 def init_log_file(label: str = "kalshi_combo_vnext") -> str:
     os.makedirs("logs", exist_ok=True)
     ts = utc_now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join("logs", f"{label}_{ts}.csv")
-    with open(path, "w", newline="") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(
             [
@@ -216,7 +220,7 @@ def append_log_row(
     total_cents: int,
     secs_to_close: float,
 ) -> None:
-    with open(path, "a", newline="") as f:
+    with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(
             [
@@ -293,7 +297,7 @@ def find_game_market(private_key, team_a: str, team_b: str, series_ticker: str) 
     return chosen
 
 def load_ncaam_bundle(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r") as f:
         return json.load(f)
 
 def resolve_ml_ticker_from_bundle(bundle: Dict[str, Any], game_key: str) -> Tuple[str, Dict[str, Any]]:
