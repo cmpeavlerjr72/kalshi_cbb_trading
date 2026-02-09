@@ -21,6 +21,9 @@ from dotenv import load_dotenv
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 import threading
+
+from fill_price_fix import calculate_vwap_robust
+
 # =========================
 # CONFIG + .env LOADING
 # =========================
@@ -471,38 +474,23 @@ def fetch_fills_for_order(private_key, order_id: str) -> List[Dict[str, Any]]:
 
 def fills_vwap_cents(fills: List[Dict[str, Any]], side: str) -> Optional[float]:
     """
-    Try to compute VWAP from fill objects. Field names can vary;
-    we defensively look for yes_price/no_price/price.
+    Robust VWAP from fill objects using fill_price_fix.py.
+    Returns VWAP in cents, or None.
     """
-    tot_qty = 0
-    tot_px = 0.0
-    for f in fills:
-        try:
-            q = int(f.get("count", 0))
-        except (TypeError, ValueError):
-            continue
-        if q <= 0:
-            continue
-
-        px = None
-        if side == "yes":
-            px = f.get("yes_price", None)
-        else:
-            px = f.get("no_price", None)
-        if px is None:
-            px = f.get("price", None)
-
-        try:
-            px_f = float(px)
-        except (TypeError, ValueError):
-            continue
-
-        tot_qty += q
-        tot_px += px_f * q
-
-    if tot_qty == 0:
+    vwap = calculate_vwap_robust(fills, side)
+    if vwap is None:
         return None
-    return tot_px / tot_qty
+
+    # Safety clamp: Kalshi prices should be within [0, 100]
+    try:
+        v = float(vwap)
+    except (TypeError, ValueError):
+        return None
+
+    if v < 0 or v > 100:
+        return None
+
+    return v
 
 def wait_for_fill_or_timeout(
     private_key,

@@ -34,11 +34,10 @@ from combo_vnext import (
 from espn_game_clock import EspnGameClock
 
 from production_strategies import (
-    ModelEdgeStrategy,
     MeanReversionStrategy,
-    PregameAnchoredStrategy,
     GameRunner,
 )
+
 
 
 # =============================================================================
@@ -51,106 +50,59 @@ GAMES = [
     # EXAMPLE — replace with tonight's actual games before running:
     #
     {
-        "label": "Loyola Chicago at Davidson",
-        "team_name": "DAV",
-        "model_p_win": 0.68,
-        "partner_p_win":0,
+        "label": "USC at Penn St.",
+        "team_name": "USC",
+        "model_p_win": 0.55,
+        "partner_p_win":0.55,
         "segment": "Home Fav",
-        "espn_date": "20260206",
-        "espn_team": "DAV",
-        "espn_opponent": "LUC",
+        "espn_date": "20260208",
+        "espn_team": "USC",
+        "espn_opponent": "PSU",
     },
     {
-        "label": "Brown at Yale",
-        "team_name": "YALE",
-        "model_p_win": 0.57,
-        "partner_p_win":0,
-        "segment": "Home Fav",
-        "espn_date": "20260206",
-        "espn_team": "YALE",
-        "espn_opponent": "BRWN",
-    },
-    {
-        "label": "Dayton at VCU",
-        "team_name": "VCU",
-        "model_p_win": 0.57,
-        "partner_p_win":0,
-        "segment": "Home Fav",
-        "espn_date": "20260206",
-        "espn_team": "VCU",
-        "espn_opponent": "DAY",
-    },
-    {
-        "label": "Bradley at Northern Iowa",
-        "team_name": "BRAD",
+        "label": "Tulsa at South Florida",
+        "team_name": "USF",
         "model_p_win": 0.51,
-        "partner_p_win":0,
-        "segment": "Away Dog",
-        "espn_date": "20260206",
-        "espn_team": "BRAD",
-        "espn_opponent": "UNI",
+        "partner_p_win":0.51,
+        "segment": "Home Fav",
+        "espn_date": "20260208",
+        "espn_team": "USF",
+        "espn_opponent": "TLSA",
     },
     {
-        "label": "UConn at St. John's",
-        "team_name": "CONN",
-        "model_p_win": 0.53,
-        "partner_p_win":0,
-        "segment": "Away Fav",
-        "espn_date": "20260206",
-        "espn_team": "CONN",
-        "espn_opponent": "SJU",
-    },
-    {
-        "label": "Drake at Illinois St.",
-        "team_name": "ILST",
+        "label": "Texas Tech at West Virginia",
+        "team_name": "TTU",
         "model_p_win": 0.59,
-        "partner_p_win":0,
+        "partner_p_win":0.59,
         "segment": "Home Fav",
-        "espn_date": "20260206",
-        "espn_team": "ILST",
-        "espn_opponent": "DRKE",
+        "espn_date": "20260208",
+        "espn_team": "TTU",
+        "espn_opponent": "WVU",
     },
     {
-        "label": "Evansville at Valparaiso",
-        "team_name": "VALP",
-        "model_p_win": 0.63,
-        "partner_p_win":0,
-        "segment": "Home Fav",
-        "espn_date": "20260206",
-        "espn_team": "VAL",
-        "espn_opponent": "EVAN",
+        "label": "Wichita St. at Tulane",
+        "team_name": "WICH",
+        "model_p_win": 0.62,
+        "partner_p_win":0.62,
+        "segment": "Away Dog",
+        "espn_date": "20260208",
+        "espn_team": "WICH",
+        "espn_opponent": "TULN",
     },
     {
-        "label": "Murray St. at Southern Illinois",
-        "team_name": "MURR",
-        "model_p_win": 0.53,
-        "partner_p_win":0,
+        "label": "UCF at Cincinnati",
+        "team_name": "UCF",
+        "model_p_win": 0.51,
+        "partner_p_win":0.51,
         "segment": "Away Fav",
-        "espn_date": "20260206",
-        "espn_team": "MUR",
-        "espn_opponent": "SIU",
+        "espn_date": "20260208",
+        "espn_team": "UCF",
+        "espn_opponent": "CIN",
     },
-    {
-        "label": "Belmont at UIC",
-        "team_name": "BEL",
-        "model_p_win": 0.56,
-        "partner_p_win":0,
-        "segment": "Away Fav",
-        "espn_date": "20260206",
-        "espn_team": "BEL",
-        "espn_opponent": "UIC",
-    },
+
+
 ]
 
-# Per-strategy allocations (dollars per game)
-# Rebalanced: MR earned it, ME needs to prove itself with circuit breakers
-ALLOCATIONS = {
-    "model_edge": 5.00,       # Reduced from $2 — circuit breakers should help but let's see
-    "mean_reversion": 5.00,   # Increased from $2 — was the star last night in good markets
-    "pregame_anchored": 5.00,   # Kept small — 0 trades last night, give it another shot
-}
-
-TOTAL_PER_GAME = sum(ALLOCATIONS.values())
 
 # =============================================================================
 # MARKET RESOLUTION
@@ -226,29 +178,24 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
         model_fair = int(game_config["model_p_win"] * 100)
         partner_fair = int(game_config["partner_p_win"] * 100)
 
+        preferred_side = "yes" if game_config["model_p_win"] >= 0.50 else "no"
+
         strategies = [
-            ModelEdgeStrategy(
-                max_capital=ALLOCATIONS["model_edge"],
-                model_fair_cents=model_fair,
-            ),
-            PregameAnchoredStrategy(
-                max_capital=ALLOCATIONS["pregame_anchored"],
-                model_fair_cents=model_fair,
-                partner_fair_cents=partner_fair,
-                cushion_cents=6,
-            ),
             MeanReversionStrategy(
-                max_capital=ALLOCATIONS["mean_reversion"],
+                max_capital=float(game_config["allocation"]),
+                preferred_side=preferred_side,
             ),
         ]
 
 
+
         print_status(
-            f"[{label}] Strategies: "
-            f"ME(ESPN)@{model_fair}¢(${ALLOCATIONS['model_edge']}) | "
-            f"PA(${ALLOCATIONS['pregame_anchored']}) | "
-            f"MR(${ALLOCATIONS['mean_reversion']})"
+            f"[{label}] Strategy: MR ONLY | "
+            f"Alloc:${game_config['allocation']:.2f} | "
+            f"Preferred:{preferred_side.upper()} | "
+            f"ModelFair:{int(game_config['model_p_win']*100)}c"
         )
+
 
 
         runner = GameRunner(
@@ -293,17 +240,16 @@ def main():
         print(f"     Model: {game['team_name']} @ {game['model_p_win']:.0%}")
         print(f"     Segment: {game.get('segment', 'N/A')}")
 
-    print(f"\nPER-GAME: ${TOTAL_PER_GAME:.2f}")
-    for s, a in ALLOCATIONS.items():
-        print(f"  {s}: ${a:.2f}")
-    print(f"TOTAL AT RISK: ${TOTAL_PER_GAME * len(GAMES):.2f}")
+    print(f"\nRUN MODE: MR ONLY (equal-split bankroll)")
+
 
     print("\nFIXES ACTIVE:")
-    print("  P1: ME circuit breakers (divergence, final-5min, side cooldown, market-decided)")
-    print("  P2: MR adaptive threshold (2.5σ low-vol, warmup, dead market kill)")
+    print("  MR: stop-loss OFF")
+    print("  MR: size scales to per-game allocation")
+    print("  MR: last-5min directional (only preferred side + flatten wrong-side)")
     print("  P3: Market quality pre-filter (skip dead/illiquid after warmup)")
-    print("  P4: Settlement-aware P&L warnings near close")
-    print("  P5: Fee-aware edge thresholds + lock attempt cap")
+    print("  P4: Settlement-aware warnings + live R/U/T PnL display")
+
 
     # Load credentials
     api_key = os.getenv("KALSHI_API_KEY_ID", "").strip()
@@ -324,9 +270,14 @@ def main():
         resp = _get(private_key, "/trade-api/v2/portfolio/balance")
         balance = int(resp.get("balance", 0)) / 100
         print(f"✓ Balance: ${balance:.2f}")
-        required = TOTAL_PER_GAME * len(GAMES)
-        if balance < required:
-            print(f"  ⚠ Balance ${balance:.2f} < Required ${required:.2f}")
+
+        per_game_allocation = balance / max(1, len(GAMES))
+
+        for g in GAMES:
+            g["allocation"] = per_game_allocation
+
+        print(f"✓ Per-game allocation (equal split): ${per_game_allocation:.2f}")
+
     except Exception as e:
         print(f"✗ Balance check failed: {e}")
         return 1

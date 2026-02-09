@@ -300,10 +300,8 @@ class BaseStrategy(ABC):
         self.positions.append(pos)
         self.last_entry_time = time.time()
 
-        if side == "yes":
-            self.capital_used += (100 - price) * qty / 100
-        else:
-            self.capital_used += price * qty / 100
+        # Cash required = price you pay, for BOTH sides
+        self.capital_used += price * qty / 100
 
         return pos
 
@@ -348,11 +346,8 @@ class BaseStrategy(ABC):
         self.closed.append(closed)
         self.positions.remove(position)
 
-        # Free capital
-        if position.side == "yes":
-            self.capital_used -= (100 - position.entry_price) * position.qty / 100
-        else:
-            self.capital_used -= position.entry_price * position.qty / 100
+        # Free capital — matches the price we paid on entry
+        self.capital_used -= position.entry_price * position.qty / 100
         self.capital_used = max(0, self.capital_used)
 
         # P1: Record stop-out for cooldown
@@ -545,8 +540,8 @@ class ModelEdgeStrategy(BaseStrategy):
 
             if yes_bid:
                 pnl = yes_bid - position.entry_price
-                if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
+                # if pnl <= -self.params["stop_loss"]:
+                #     return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
                 if pnl >= self.params["take_profit"]:
                     return True, "take_profit", int(yes_bid) - 1, f"tp:{pnl:.0f}c"
         else:
@@ -558,8 +553,8 @@ class ModelEdgeStrategy(BaseStrategy):
 
             if no_bid:
                 pnl = no_bid - position.entry_price
-                if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
+                # if pnl <= -self.params["stop_loss"]:
+                #     return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
                 if pnl >= self.params["take_profit"]:
                     return True, "take_profit", int(no_bid) - 1, f"tp:{pnl:.0f}c"
 
@@ -572,34 +567,65 @@ class ModelEdgeStrategy(BaseStrategy):
 
 class MeanReversionStrategy(BaseStrategy):
     """
-    Buy when price drops sharply below SMA, exit on reversion.
-    
-    Feb 6 fixes:
-      - P2a: Dynamic σ multiplier (2.5σ if vol <5¢, else 1.5σ)
-      - P2b: Require 60 samples + recent range >5¢ before first entry
-      - P2c: Dead market detection (stop if no >3¢ move in last 30 samples)
+    MR with:
+      - stop loss OFF
+      - dynamic sigma thresholds (existing)
+      - late-game directional behavior:
+          * within last N secs, ONLY enter preferred side
+          * within last N secs, flatten any wrong-side open inventory
+      - size-aware entries: qty scales to remaining allocated capital
     """
 
-    def __init__(self, max_capital: float):
+    def __init__(self, max_capital: float, preferred_side: Optional[str] = None):
         params = {
             "lookback": 60,
-            "base_std_mult": 1.5,
-            "high_vol_std_mult": 1.5,   # normal threshold
-            "low_vol_std_mult": 2.5,    # P2a: tighter in quiet markets
-            "low_vol_cutoff": 5.0,      # P2a: σ below this = "low vol"
-            "stop_loss": 15,
-            "max_positions": 2,
-            "min_entry_gap_secs": 30,
-            "side_cooldown_secs": 90,
-            "stop_trading_before_close_secs": 300,
-            "warmup_samples": 60,       # P2b
-            "warmup_min_range": 5.0,    # P2b
-            "dead_lookback": 30,        # P2c
-            "dead_min_move": 3.0,       # P2c
+            "high_vol_std_mult": 1.5,
+            "low_vol_std_mult": 2.5,
+            "low_vol_cutoff": 5.0,
+            "reversion_exit_pnl_floor": -3,
+
+            # stop loss intentionally unused / OFF
+            "stop_loss": 0,
+
+            # allow more room; you can tune
+            "max_positions": 4,
+
+            "min_entry_gap_secs": 8,
+            "side_cooldown_secs": 20,
+
+            # IMPORTANT: allow entries into late game; directional filter controls safety
+            "stop_trading_before_close_secs": 0,
+
+            # warmup / dead-market checks (unchanged)
+            "warmup_samples": 60,
+            "warmup_min_range": 5.0,
+            "dead_lookback": 30,
+            "dead_min_move": 3.0,
+
+            # NEW: direction window (last 5 minutes)
+            "directional_close_secs": 300,
+            "force_exit_wrong_side": True,
+
+            # --- SIZING ---
+            # Each entry uses a fraction of remaining capital, scaled by signal strength.
+            # At 1.5σ (minimum trigger in high-vol) → base_frac of remaining capital.
+            # At 3σ+ → up to max_frac. Linear interpolation between.
+            "size_base_frac": 0.35,       # fraction of remaining capital at minimum σ trigger
+            "size_max_frac": 0.80,        # fraction at 3σ+
+            "size_sigma_floor": 1.5,      # σ level that maps to base_frac
+            "size_sigma_cap": 3.0,        # σ level that maps to max_frac
+            "size_min_qty": 3,            # never go below this (keeps every trade meaningful)
+            "max_order_qty": 200,         # hard cap per single order
         }
         super().__init__("mean_reversion", max_capital, params)
+
         self.prices: deque = deque(maxlen=params["lookback"])
-        self._warmup_done = False
+
+        if preferred_side is not None:
+            preferred_side = preferred_side.lower().strip()
+            if preferred_side not in ("yes", "no"):
+                preferred_side = None
+        self.preferred_side = preferred_side
 
     def _calc_stats(self) -> Tuple[float, float]:
         if len(self.prices) < 5:
@@ -611,7 +637,6 @@ class MeanReversionStrategy(BaseStrategy):
         return mean, std
 
     def _check_warmup(self) -> Tuple[bool, str]:
-        """P2b: Require N samples AND sufficient range"""
         n = len(self.prices)
         if n < self.params["warmup_samples"]:
             return False, f"warmup:{n}/{self.params['warmup_samples']}"
@@ -624,58 +649,118 @@ class MeanReversionStrategy(BaseStrategy):
         return True, "ok"
 
     def _is_dead_market(self) -> bool:
-        """P2c: No meaningful movement in recent samples"""
         lookback = self.params["dead_lookback"]
         if len(self.prices) < lookback:
             return False
         recent = list(self.prices)[-lookback:]
         return (max(recent) - min(recent)) < self.params["dead_min_move"]
 
+    def _collateral_per_contract(self, side: str, price_cents: int) -> float:
+        """
+        Approx collateral in dollars per contract:
+        Kalshi cash required to BUY:
+          YES buy at p: you pay p cents
+          NO  buy at p: you pay p cents
+        """
+        return price_cents / 100.0
+
+    def _size_qty(self, side: str, price_cents: int, sigma_mult: float = 1.5) -> int:
+        """
+        σ-scaled tranche sizing:
+          - Compute remaining capital in dollars
+          - Pick a fraction of that capital based on how strong the signal is (σ)
+          - Weaker signal (1.5σ) → 35% of remaining. Stronger (3σ+) → 80%.
+          - This naturally scales DOWN as capital depletes across entries,
+            but still pushes high counts early.
+          - Minimum floor of size_min_qty so every trade is meaningful.
+        """
+        remaining = max(0.0, float(self.max_capital) - float(self.capital_used))
+        per = self._collateral_per_contract(side, price_cents)
+        if per <= 0:
+            return 0
+
+        # How many contracts could we possibly buy with ALL remaining capital?
+        max_possible = int(remaining / per)
+
+        # σ-scaled fraction: linear interpolation between base_frac and max_frac
+        sigma_floor = float(self.params.get("size_sigma_floor", 1.5))
+        sigma_cap = float(self.params.get("size_sigma_cap", 3.0))
+        base_frac = float(self.params.get("size_base_frac", 0.35))
+        max_frac = float(self.params.get("size_max_frac", 0.80))
+
+        # Clamp sigma_mult into [floor, cap] then interpolate
+        t = max(0.0, min(1.0, (sigma_mult - sigma_floor) / max(0.01, sigma_cap - sigma_floor)))
+        frac = base_frac + t * (max_frac - base_frac)
+
+        qty = int(max_possible * frac)
+
+        # Apply floor and cap
+        min_qty = int(self.params.get("size_min_qty", 3))
+        max_qty = int(self.params.get("max_order_qty", 200))
+
+        qty = max(min(min_qty, max_possible), qty)  # floor, but don't exceed what's affordable
+        qty = min(qty, max_qty)
+        qty = min(qty, max_possible)  # final safety: never exceed capital
+
+        return max(0, qty)
+
+    def _in_directional_window(self, secs_to_close: int) -> bool:
+        directional_secs = int(self.params.get("directional_close_secs", 300))
+        return (
+            self.preferred_side in ("yes", "no")
+            and secs_to_close <= directional_secs
+        )
+
     def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
         yes_bid = prices.get("best_yes_bid")
         yes_ask = prices.get("imp_yes_ask")
         no_ask = prices.get("imp_no_ask")
 
-        if not yes_bid or not yes_ask:
+        if yes_bid is None or yes_ask is None:
             return False, "", 0, 0, "no_prices"
 
         mid = (yes_bid + yes_ask) / 2
         self.prices.append(mid)
 
-        # P2b: Warmup check
         warmup_ok, warmup_reason = self._check_warmup()
         if not warmup_ok:
             return False, "", 0, 0, warmup_reason
 
-        # P2c: Dead market check
         if self._is_dead_market():
             return False, "", 0, 0, "dead_market"
 
         mean, std = self._calc_stats()
 
-        # P2a: Dynamic σ multiplier
-        if std < self.params["low_vol_cutoff"]:
-            std_mult = self.params["low_vol_std_mult"]
-        else:
-            std_mult = self.params["high_vol_std_mult"]
-
+        std_mult = self.params["low_vol_std_mult"] if std < self.params["low_vol_cutoff"] else self.params["high_vol_std_mult"]
         threshold = std_mult * std
+
+        in_dir = self._in_directional_window(int(secs_to_close))
 
         # Price dropped → buy YES
         if mid < mean - threshold:
-            edge = mean - mid
+            if in_dir and self.preferred_side != "yes":
+                return False, "", 0, 0, f"dir_block:want_yes_pref_{self.preferred_side}"
             cooled, _ = self._side_on_cooldown("yes")
-            if not cooled:
-                return True, "yes", int(yes_ask), 1, \
-                    f"below:{edge:.0f}c({edge/std:.1f}σ),mult={std_mult}"
+            if cooled:
+                return False, "", 0, 0, "cooldown_yes"
+            edge = mean - mid
+            qty = self._size_qty("yes", int(yes_ask), sigma_mult=edge / std)
+            if qty <= 0:
+                return False, "", 0, 0, "no_capital"
+            return True, "yes", int(yes_ask), qty, f"below:{edge:.0f}c({edge/std:.1f}σ),mult={std_mult},qty={qty}"
 
         # Price spiked → buy NO
-        if mid > mean + threshold and no_ask:
-            edge = mid - mean
+        if mid > mean + threshold and no_ask is not None:
+            if in_dir and self.preferred_side != "no":
+                return False, "", 0, 0, f"dir_block:want_no_pref_{self.preferred_side}"
             cooled, _ = self._side_on_cooldown("no")
-            if not cooled:
-                return True, "no", int(no_ask), 1, \
-                    f"above:{edge:.0f}c({edge/std:.1f}σ),mult={std_mult}"
+            if cooled:
+                return False, "", 0, 0, "cooldown_no"
+            edge = mid - mean
+            qty = self._size_qty("no", int(no_ask), sigma_mult=edge / std)
+            if qty <= 0:
+                return False, "", 0, 0, "no_capital"
+            return True, "no", int(no_ask), qty, f"above:{edge:.0f}c({edge/std:.1f}σ),mult={std_mult},qty={qty}"
 
         return False, "", 0, 0, "in_range"
 
@@ -684,28 +769,49 @@ class MeanReversionStrategy(BaseStrategy):
         no_bid = prices.get("best_no_bid")
         yes_ask = prices.get("imp_yes_ask")
 
-        if not yes_bid:
+        if yes_bid is None:
             return False, "", 0, "no_bid"
+
+        # NEW: late-game flatten wrong-side inventory
+        if (
+            self._in_directional_window(int(secs_to_close))
+            and bool(self.params.get("force_exit_wrong_side", True))
+            and self.preferred_side in ("yes", "no")
+            and position.side != self.preferred_side
+        ):
+            if position.side == "yes" and yes_bid is not None:
+                return True, "timeout", max(1, int(yes_bid) - 1), f"dir_flatten:{int(secs_to_close)}s"
+            if position.side == "no" and no_bid is not None:
+                return True, "timeout", max(1, int(no_bid) - 1), f"dir_flatten:{int(secs_to_close)}s"
 
         mid = (yes_bid + (yes_ask or yes_bid)) / 2
         mean, std = self._calc_stats()
 
+        # Existing: reversion exit (stop loss OFF) — now PATIENT via pnl floor gate
+        pnl_floor = float(self.params.get("reversion_exit_pnl_floor", -3))
+
         if position.side == "yes":
-            pnl = yes_bid - position.entry_price
+            pnl = float(yes_bid) - float(position.entry_price)
+
+            # If we're still very underwater, do NOT "revert exit" just because mean drifted.
+            if pnl < pnl_floor:
+                return False, "", 0, f"hold_pnl_floor:{pnl:.0f}c<{pnl_floor:.0f}c"
+
             if mid >= mean - 2:
-                return True, "take_profit", int(yes_bid) - 1, f"reverted:{pnl:.0f}c"
-            if pnl <= -self.params["stop_loss"]:
-                return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
+                return True, "take_profit", max(1, int(yes_bid) - 1), f"reverted:{pnl:.0f}c"
+
         else:
-            if no_bid:
-                pnl = no_bid - position.entry_price
+            if no_bid is not None:
+                pnl = float(no_bid) - float(position.entry_price)
+
+                if pnl < pnl_floor:
+                    return False, "", 0, f"hold_pnl_floor:{pnl:.0f}c<{pnl_floor:.0f}c"
+
                 if mid <= mean + 2:
-                    return True, "take_profit", int(no_bid) - 1, f"reverted:{pnl:.0f}c"
-                if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
+                    return True, "take_profit", max(1, int(no_bid) - 1), f"reverted:{pnl:.0f}c"
 
         return False, "", 0, "hold"
-    
+
 # =============================================================================
 # STRATEGY 3: PREGAME ANCHORED + LIVE MANAGEMENT (partner test)
 # =============================================================================
@@ -868,8 +974,8 @@ class PregameAnchoredStrategy(BaseStrategy):
                 pnl = yes_bid - position.entry_price
                 if pnl >= self.params["take_profit"]:
                     return True, "take_profit", int(yes_bid) - 1, f"tp:{pnl:.0f}c"
-                if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
+                # if pnl <= -self.params["stop_loss"]:
+                #     return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
 
         else:
             if yes_ask is not None and position.lock_attempts < self.params["max_lock_attempts"]:
@@ -882,8 +988,8 @@ class PregameAnchoredStrategy(BaseStrategy):
                 pnl = no_bid - position.entry_price
                 if pnl >= self.params["take_profit"]:
                     return True, "take_profit", int(no_bid) - 1, f"tp:{pnl:.0f}c"
-                if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
+                # if pnl <= -self.params["stop_loss"]:
+                #     return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
 
         return False, "", 0, "hold"
 
@@ -945,8 +1051,8 @@ class SpreadCaptureStrategy(BaseStrategy):
                     return True, "lock", int(no_ask), f"lock:{profit:.0f}c"
             if yes_bid:
                 pnl = yes_bid - position.entry_price
-                if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
+                # if pnl <= -self.params["stop_loss"]:
+                #     return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
         else:
             if yes_ask and position.lock_attempts < self.params["max_lock_attempts"]:
                 profit = 100 - position.entry_price - yes_ask
@@ -955,8 +1061,8 @@ class SpreadCaptureStrategy(BaseStrategy):
                     return True, "lock", int(yes_ask), f"lock:{profit:.0f}c"
             if no_bid:
                 pnl = no_bid - position.entry_price
-                if pnl <= -self.params["stop_loss"]:
-                    return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
+                # if pnl <= -self.params["stop_loss"]:
+                #     return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
 
         return False, "", 0, "waiting"
 
@@ -1090,6 +1196,7 @@ class GameRunner:
                 self._log_event(strategy.name, "entry_skip_liquidity", f"{side}@{price}c")
                 return None
 
+
             order_id = place_limit_buy(self.private_key, self.ticker, side, price, qty)
             wait_secs = int(strategy.entry_wait_secs(context) or 15)
             filled, vwap = wait_for_fill_or_timeout(self.private_key, order_id, side, max_wait_secs=wait_secs)
@@ -1195,6 +1302,46 @@ class GameRunner:
                     self._log_event(strategy.name, "settlement_warning",
                                    f"{pos.side}@{pos.entry_price:.0f}c mid={mid:.0f}c")
 
+    def _calc_unrealized_pnl(self, prices: Dict[str, Any]) -> float:
+        """
+        Mark-to-market UNREALIZED net PnL (in cents), using best bids as exit.
+        Includes estimated taker fee for the exit.
+        """
+        yes_bid = prices.get("best_yes_bid")
+        no_bid = prices.get("best_no_bid")
+
+        unreal = 0.0
+        for s in self.strategies:
+            for pos in s.positions:
+                if pos.side == "yes" and yes_bid is not None:
+                    gross = (float(yes_bid) - pos.entry_price) * pos.qty
+                    fee_est = calc_taker_fee(int(yes_bid), pos.qty)
+                    unreal += (gross - fee_est)
+                elif pos.side == "no" and no_bid is not None:
+                    gross = (float(no_bid) - pos.entry_price) * pos.qty
+                    fee_est = calc_taker_fee(int(no_bid), pos.qty)
+                    unreal += (gross - fee_est)
+        return unreal
+
+    def _calc_realized_pnl(self) -> float:
+        """Realized net PnL (in cents) from closed positions."""
+        realized = 0.0
+        for s in self.strategies:
+            realized += sum(c.net_pnl for c in s.closed)
+        return realized
+    
+    def _open_inventory_by_side(self) -> str:
+        yes_qty = 0
+        no_qty = 0
+        for s in self.strategies:
+            for pos in s.positions:
+                if pos.side == "yes":
+                    yes_qty += pos.qty
+                elif pos.side == "no":
+                    no_qty += pos.qty
+        return f"inv YES:{yes_qty} NO:{no_qty}"
+
+
     # --- Main loop ---
 
     def _get_secs_to_close(self) -> Tuple[float, str, Optional[float], Optional[float], Optional[int]]:
@@ -1277,11 +1424,26 @@ class GameRunner:
             # Status every 30 ticks
             if self.snapshots % 30 == 0:
                 open_count = sum(len(s.positions) for s in self.strategies)
+                realized = self._calc_realized_pnl()
+                unreal = self._calc_unrealized_pnl(prices)
+                total = realized + unreal
+                inv = self._open_inventory_by_side()
+                pref = ""
+                for s in self.strategies:
+                    if hasattr(s, "preferred_side") and s.preferred_side:
+                        pref = s.preferred_side.upper()
+                        break
+
                 print_status(
                     f"[{self.label}] Y:{yes_bid}/{yes_ask} | "
                     f"secs:{int(secs_to_close)} src:{clock_source} | "
-                    f"open:{open_count} | mq:{mq_reason}"
+                    f"open:{open_count} | mq:{mq_reason} | "
+                    f"{inv} pref:{pref} | "
+                    f"PnL R:{realized:.1f}c U:{unreal:.1f}c T:{total:.1f}c "
+                    f"(${total/100:.2f})"
                 )
+
+
 
             # P4: Settlement warnings near close
             self._settlement_pnl_warning(prices, int(secs_to_close))

@@ -1,0 +1,52 @@
+[
+{
+    "label": "USC at Penn St.",
+    "team_name": "USC",
+    "model_p_win": 0.55,
+    "partner_p_win":0.55,
+    "segment": "Home Fav",
+    "espn_date": "20260208",
+    "espn_team": "USC",
+    "espn_opponent": "PSU"
+},
+{
+    "label": "Tulsa at South Florida",
+    "team_name": "USF",
+    "model_p_win": 0.51,
+    "partner_p_win":0.51,
+    "segment": "Home Fav",
+    "espn_date": "20260208",
+    "espn_team": "USF",
+    "espn_opponent": "TLSA"
+},
+{
+    "label": "Texas Tech at West Virginia",
+    "team_name": "TTU",
+    "model_p_win": 0.59,
+    "partner_p_win":0.59,
+    "segment": "Home Fav",
+    "espn_date": "20260208",
+    "espn_team": "TTU",
+    "espn_opponent": "WVU"
+},
+{
+    "label": "Wichita St. at Tulane",
+    "team_name": "WICH",
+    "model_p_win": 0.62,
+    "partner_p_win":0.62,
+    "segment": "Away Dog",
+    "espn_date": "20260208",
+    "espn_team": "WICH",
+    "espn_opponent": "TULN"
+},
+{
+    "label": "UCF at Cincinnati",
+    "team_name": "UCF",
+    "model_p_win": 0.51,
+    "partner_p_win":0.51,
+    "segment": "Away Fav",
+    "espn_date": "20260208",
+    "espn_team": "UCF",
+    "espn_opponent": "CIN"
+}
+]
