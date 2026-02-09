@@ -1107,6 +1107,7 @@ class GameRunner:
         self.trade_path = f"{base}_trades.csv"
         self.position_path = f"{base}_positions.csv"
         self.event_path = f"{base}_events.csv"
+        self.orderbook_path = f"{base}_orderbook.jsonl"
         self._init_logs()
         self.snapshots = 0
 
@@ -1134,6 +1135,31 @@ class GameRunner:
             csv.writer(f).writerow([
                 "timestamp", "strategy", "event", "detail",
             ])
+
+    def _log_orderbook(self, ob: Dict[str, Any], secs_to_close: float, clock_source: str, depth: int = 25):
+        """
+        Store top-of-book + depth for later replay/backtests.
+        JSONL keeps it stream-friendly for R2 + dashboards.
+        """
+        try:
+            book = (ob.get("orderbook") or {})
+            yes_levels = (book.get("yes") or [])[:depth]
+            no_levels  = (book.get("no") or [])[:depth]
+
+            rec = {
+                "ts_utc": utc_now().isoformat(),
+                "ticker": self.ticker,
+                "secs_to_close": int(secs_to_close),
+                "clock_source": clock_source,
+                "depth": depth,
+                "yes": yes_levels,  # [[price, qty], ...] already in your format
+                "no": no_levels,
+            }
+            with open(self.orderbook_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass
+
 
     def _log_snapshot(self, prices, secs_to_close, clock_source, mq_std, mq_ok, espn_wp, game_progress, secs_to_tip):
 
@@ -1190,6 +1216,7 @@ class GameRunner:
         try:
             # Liquidity check before sending order
             ob = fetch_orderbook(self.ticker)
+
             px = derive_prices(ob)
             if not has_fill_liquidity_for_implied_buy(px, side, price, min_qty=max(MIN_LIQUIDITY_CONTRACTS, qty)):
                 print_status(f"[{self.label}][{strategy.name}] SKIP — no liquidity for {side} @{price}c")
@@ -1391,6 +1418,7 @@ class GameRunner:
             try:
                 ob = fetch_orderbook(self.ticker)
                 prices = derive_prices(ob)
+                self._log_orderbook(ob, secs_to_close, clock_source, depth=int(os.getenv("OB_DEPTH") or "10"))
             except Exception as e:
                 print_status(f"[{self.label}] Orderbook error: {e}")
                 time.sleep(POLL_INTERVAL_SECS)
