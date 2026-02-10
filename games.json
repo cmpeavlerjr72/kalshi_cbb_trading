@@ -1,92 +1,42 @@
 [
 {
-    "label": "Prairie View A&M at Florida A&M",
-    "team_name": "PV",
-    "model_p_win": 0.56,
-    "partner_p_win":0.56,
+    "label": "Milwaukee at IU Indy",
+    "team_name": "MILW",
+    "model_p_win": 0.51,
+    "partner_p_win":0.51,
     "segment": "Home Fav",
-    "espn_date": "20260209",
-    "espn_team": "PV",
-    "espn_opponent": "FAMU"
+    "espn_date": "20260210",
+    "espn_team": "MILW",
+    "espn_opponent": "IUIN"
 },
 {
-    "label": "Incarnate Word at Southeastern Louisiana",
-    "team_name": "IW",
+    "label": "Vanderbilt at Auburn",
+    "team_name": "VAN",
     "model_p_win": 0.55,
     "partner_p_win":0.55,
     "segment": "Home Fav",
-    "espn_date": "20260209",
-    "espn_team": "UIW",
-    "espn_opponent": "SELA"
+    "espn_date": "20260210",
+    "espn_team": "VAN",
+    "espn_opponent": "AUB"
 },
 {
-    "label": "Southern Illinois at Indiana St.",
-    "team_name": "SIU",
-    "model_p_win": 0.61,
-    "partner_p_win":0.61,
+    "label": "North Carolina at Miami (FL)",
+    "team_name": "MIA",
+    "model_p_win": 0.51,
+    "partner_p_win":0.51,
     "segment": "Home Fav",
-    "espn_date": "20260209",
-    "espn_team": "SIU",
-    "espn_opponent": "INST"
+    "espn_date": "20260210",
+    "espn_team": "MIA",
+    "espn_opponent": "UNC"
 },
 {
-    "label": "Valparaiso at Drake",
-    "team_name": "VALP",
-    "model_p_win": 0.501,
-    "partner_p_win":0.501,
+    "label": "Purdue at Nebraska",
+    "team_name": "NEB",
+    "model_p_win": 0.52,
+    "partner_p_win":0.52,
     "segment": "Away Dog",
-    "espn_date": "20260209",
-    "espn_team": "VAL",
-    "espn_opponent": "DRKE"
-},
-{
-    "label": "UT Rio Grande Valley at Nicholls St.",
-    "team_name": "UTRGV",
-    "model_p_win": 0.55,
-    "partner_p_win":0.55,
-    "segment": "Away Fav",
-    "espn_date": "20260209",
-    "espn_team": "RGV",
-    "espn_opponent": "NICH"
-},
-{
-    "label": "Belmont at Bradley",
-    "team_name": "BEL",
-    "model_p_win": 0.54,
-    "partner_p_win":0.54,
-    "segment": "Away Fav",
-    "espn_date": "20260209",
-    "espn_team": "BEL",
-    "espn_opponent": "BRAD"
-},
-{
-    "label": "UNC Wilmington at Charleston",
-    "team_name": "UNCW",
-    "model_p_win": 0.58,
-    "partner_p_win":0.58,
-    "segment": "Away Fav",
-    "espn_date": "20260209",
-    "espn_team": "UNCW",
-    "espn_opponent": "COFC"
-},
-{
-    "label": "Texas A&M-Corpus Christi at New Orleans",
-    "team_name": "AMCC",
-    "model_p_win": 0.59,
-    "partner_p_win":0.59,
-    "segment": "Away Fav",
-    "espn_date": "20260209",
-    "espn_team": "AMCC",
-    "espn_opponent": "UNO"
-},
-{
-    "label": "Arizona at Kansas",
-    "team_name": "ARIZ",
-    "model_p_win": 0.68,
-    "partner_p_win":0.68,
-    "segment": "Away Fav",
-    "espn_date": "20260209",
-    "espn_team": "ARIZ",
-    "espn_opponent": "KU"
+    "espn_date": "20260210",
+    "espn_team": "NEB",
+    "espn_opponent": "PUR"
 }
 ]

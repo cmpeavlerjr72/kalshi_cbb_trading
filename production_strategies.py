@@ -18,6 +18,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple
+from pathlib import Path
 from collections import deque
 import datetime as dt
 
@@ -170,6 +171,9 @@ class Position:
     entry_reason: str
     entry_fee: float = 0.0
     lock_attempts: int = 0  # P5: track lock attempts
+        # NEW: MR profit-defense tracking (per-contract cents)
+    max_fav_pnl_cents: float = 0.0
+    max_fav_ts: Optional[str] = None
 
 
 @dataclass
@@ -616,6 +620,14 @@ class MeanReversionStrategy(BaseStrategy):
             "size_sigma_cap": 3.0,        # σ level that maps to max_frac
             "size_min_qty": 3,            # never go below this (keeps every trade meaningful)
             "max_order_qty": 200,         # hard cap per single order
+
+            # NEW: PROFIT DEFENSE (giveback cap)
+            # Once a position reaches +Xc per contract, protect it:
+            # exit if current pnl falls below (peak * (1 - giveback_frac)).
+            "profit_defense_activate_cents": 10.0,   # activate once peak >= this
+            "profit_defense_giveback_frac": 0.50,    # allow 50% giveback from peak
+            "profit_defense_min_keep_cents": 1.0,    # don’t exit for tiny noise; require pnl <= this threshold too
+
         }
         super().__init__("mean_reversion", max_capital, params)
 
@@ -793,6 +805,24 @@ class MeanReversionStrategy(BaseStrategy):
         if position.side == "yes":
             pnl = float(yes_bid) - float(position.entry_price)
 
+            # --- NEW: Profit-defense giveback exit ---
+            # Track peak favorable pnl (per-contract)
+            if pnl > position.max_fav_pnl_cents:
+                position.max_fav_pnl_cents = pnl
+                position.max_fav_ts = utc_now().isoformat()
+
+            activate = float(self.params.get("profit_defense_activate_cents", 10.0))
+            giveback_frac = float(self.params.get("profit_defense_giveback_frac", 0.50))
+            min_keep = float(self.params.get("profit_defense_min_keep_cents", 1.0))
+
+            if position.max_fav_pnl_cents >= activate:
+                floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
+                # only trigger if we're meaningfully giving back (and not just tiny wiggle)
+                if pnl <= max(min_keep, floor):
+                    return True, "take_profit", max(1, int(yes_bid) - 1), \
+                        f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c"
+
+
             # If we're still very underwater, do NOT "revert exit" just because mean drifted.
             if pnl < pnl_floor:
                 return False, "", 0, f"hold_pnl_floor:{pnl:.0f}c<{pnl_floor:.0f}c"
@@ -803,6 +833,22 @@ class MeanReversionStrategy(BaseStrategy):
         else:
             if no_bid is not None:
                 pnl = float(no_bid) - float(position.entry_price)
+
+                    # --- NEW: Profit-defense giveback exit ---
+                if pnl > position.max_fav_pnl_cents:
+                    position.max_fav_pnl_cents = pnl
+                    position.max_fav_ts = utc_now().isoformat()
+
+                activate = float(self.params.get("profit_defense_activate_cents", 10.0))
+                giveback_frac = float(self.params.get("profit_defense_giveback_frac", 0.50))
+                min_keep = float(self.params.get("profit_defense_min_keep_cents", 1.0))
+
+                if position.max_fav_pnl_cents >= activate:
+                    floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
+                    if pnl <= max(min_keep, floor):
+                        return True, "take_profit", max(1, int(no_bid) - 1), \
+                            f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c"
+
 
                 if pnl < pnl_floor:
                     return False, "", 0, f"hold_pnl_floor:{pnl:.0f}c<{pnl_floor:.0f}c"
@@ -847,9 +893,8 @@ class PregameAnchoredStrategy(BaseStrategy):
             "stop_loss": 18,
             "take_profit": 15,
             "exit_with_secs_remaining": 600,  # 10 minutes
-            "pregame_window_secs": 300,       # 5 minutes
             "max_positions": 1,
-            "min_entry_gap_secs": 999999,     # we handle re-tries ourselves
+            "min_entry_gap_secs": 60,     # we handle re-tries ourselves
             "side_cooldown_secs": 0,
             "stop_trading_before_close_secs": 0,  # allow entry pregame even though "close" is far
             "max_lock_attempts": 2,
@@ -862,24 +907,19 @@ class PregameAnchoredStrategy(BaseStrategy):
         self.model_share = float(model_share)
 
         # State: only attempt ONE pregame order; if it doesn't fill, we skip the game.
-        self._pregame_attempted = False
-        self._pregame_failed = False
+        # NEW: keep retrying pregame until ESPN goes live (rate-limited by min_entry_gap_secs)
+        self._last_pregame_try_ts: Optional[float] = None
+
 
     # --- BaseStrategy hooks ---
 
     def entry_wait_secs(self, context: Dict[str, Any]) -> int:
-        """Wait up to tip (<=5m window) so the limit rests and can fill."""
-        secs_to_tip = context.get("secs_to_tip")
-        if isinstance(secs_to_tip, (int, float)):
-            window = int(self.params.get("pregame_window_secs", 300))
-            if 0 < secs_to_tip <= window:
-                return max(15, int(secs_to_tip))
-        return 15
+        # Rest as maker briefly, then cancel/timeout so we can reprice later
+        return int(os.getenv("PREGAME_REST_SECS") or "15")
 
     def on_entry_result(self, filled: bool, context: Dict[str, Any]) -> None:
-        # If our single pregame attempt doesn't fill, do not keep chasing.
-        if self._pregame_attempted and not filled:
-            self._pregame_failed = True
+        # If no fill, we just try again later (rate-limited)
+        return
 
     # --- Internal helpers ---
 
@@ -901,21 +941,19 @@ class PregameAnchoredStrategy(BaseStrategy):
         return target
 
     # --- Strategy interface ---
-
     def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
-        if self._pregame_failed:
-            return False, "", 0, 0, "pregame_failed"
         if self.positions:
             return False, "", 0, 0, "already_in"
-        if self._pregame_attempted:
-            return False, "", 0, 0, "pregame_attempted"
 
-        secs_to_tip = context.get("secs_to_tip")
-        window = int(self.params.get("pregame_window_secs", 300))
-        if not isinstance(secs_to_tip, (int, float)):
-            return False, "", 0, 0, "no_secs_to_tip"
-        if not (0 < secs_to_tip <= window):
-            return False, "", 0, 0, f"not_in_window:{int(secs_to_tip)}s"
+        # Only run pregame anchor if ESPN is NOT live yet
+        if bool(context.get("espn_is_live")):
+            return False, "", 0, 0, "espn_live_now"
+
+        # Rate-limit our retries
+        now = time.time()
+        gap = int(self.params.get("min_entry_gap_secs", 60))
+        if self._last_pregame_try_ts is not None and (now - self._last_pregame_try_ts) < gap:
+            return False, "", 0, 0, f"pregame_throttle:{int(now - self._last_pregame_try_ts)}s/{gap}s"
 
         yes_bid = prices.get("best_yes_bid")
         yes_ask = prices.get("imp_yes_ask")
@@ -923,29 +961,42 @@ class PregameAnchoredStrategy(BaseStrategy):
         no_ask = prices.get("imp_no_ask")
 
         if yes_bid is None or yes_ask is None:
-            return False, "", 0, 0, "no_yes_prices"
+            return False, "", 0, 0, "no_prices"
 
-        mid = (yes_bid + yes_ask) / 2
-        fair_yes = self._pregame_fair_yes(mid)
+        market_mid = (yes_bid + yes_ask) / 2.0
+        fair_yes = self._pregame_fair_yes(market_mid)
 
-        min_edge = int(self.params.get("min_entry_edge", 8))
+        # Edge to buy YES at ask
+        yes_edge = fair_yes - float(yes_ask)
 
-        # Decide side based on fair vs market
-        side = ""
-        if fair_yes >= mid + min_edge:
-            side = "yes"
-            px = self._improved_limit(yes_bid, yes_ask)
-        elif fair_yes <= mid - min_edge:
-            side = "no"
-            px = self._improved_limit(no_bid, no_ask)
+        # Edge to buy NO at ask (fair_no = 100 - fair_yes)
+        no_edge = (100.0 - fair_yes) - float(no_ask) if no_ask is not None else -9999.0
+
+        min_edge = float(self.params.get("min_entry_edge", 8))
+
+        # Choose the better side if it clears min edge
+        choose_side = None
+        if yes_edge >= min_edge and yes_edge >= no_edge:
+            choose_side = "yes"
+        elif no_ask is not None and no_edge >= min_edge:
+            choose_side = "no"
+
+        if choose_side is None:
+            return False, "", 0, 0, f"no_edge:yes={yes_edge:.1f}c no={no_edge:.1f}c min={min_edge}"
+
+        if choose_side == "yes":
+            limit_px = self._improved_limit(yes_bid, yes_ask)
+            if limit_px is None:
+                return False, "", 0, 0, "bad_limit_yes"
+            self._last_pregame_try_ts = now
+            return True, "yes", int(limit_px), 1, f"pregame_yes:fair={fair_yes:.1f} ask={yes_ask} edge={yes_edge:.1f}c"
         else:
-            return False, "", 0, 0, f"no_edge:fair={fair_yes:.1f},mid={mid:.1f}"
-
-        if not side or px is None:
-            return False, "", 0, 0, "no_price_after_improve"
-
-        self._pregame_attempted = True
-        return True, side, int(px), 1, f"pregame:fair={fair_yes:.1f} mid={mid:.1f} tip={int(secs_to_tip)}s"
+            # For NO: we “buy NO” at a price in the NO book → use no_bid/no_ask
+            limit_px = self._improved_limit(no_bid, no_ask)
+            if limit_px is None:
+                return False, "", 0, 0, "bad_limit_no"
+            self._last_pregame_try_ts = now
+            return True, "no", int(limit_px), 1, f"pregame_no:fair_no={100-fair_yes:.1f} ask={no_ask} edge={no_edge:.1f}c"
 
     def evaluate_exit(self, position, prices, secs_to_close, context) -> Tuple[bool, str, int, str]:
         yes_bid = prices.get("best_yes_bid")
@@ -1085,6 +1136,7 @@ class GameRunner:
         strategies: List[BaseStrategy],
         private_key,
         espn_clock=None,
+        log_dir: Optional[str] = None,
     ):
         self.label = game_label
         self.ticker = ticker
@@ -1100,14 +1152,18 @@ class GameRunner:
         self._market_kill_reason = ""
 
         # Logging
-        os.makedirs("logs", exist_ok=True)
-        ts = utc_now().strftime("%Y%m%d_%H%M%S")
-        base = f"logs/multistrat_{game_label}_{ts}"
-        self.snapshot_path = f"{base}_snapshots.csv"
-        self.trade_path = f"{base}_trades.csv"
-        self.position_path = f"{base}_positions.csv"
-        self.event_path = f"{base}_events.csv"
-        self.orderbook_path = f"{base}_orderbook.jsonl"
+        if log_dir is None:
+            raise ValueError("GameRunner requires log_dir")
+
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        self.snapshot_path = self.log_dir / "snapshots.csv"
+        self.trade_path = self.log_dir / "trades.csv"
+        self.position_path = self.log_dir / "positions.csv"
+        self.event_path = self.log_dir / "events.csv"
+        self.orderbook_path = self.log_dir / "orderbook.jsonl"
+
         self._init_logs()
         self.snapshots = 0
 
@@ -1371,7 +1427,7 @@ class GameRunner:
 
     # --- Main loop ---
 
-    def _get_secs_to_close(self) -> Tuple[float, str, Optional[float], Optional[float], Optional[int]]:
+    def _get_secs_to_close(self) -> Tuple[float, str, Optional[float], Optional[float], Optional[int], bool]:
         """
         Returns:
         (secs_to_close, clock_source, espn_live_win_pct, game_progress, secs_to_tip)
@@ -1386,6 +1442,10 @@ class GameRunner:
         if self.espn_clock:
             try:
                 ctx = self.espn_clock.get_live_context()
+                state = (ctx.get("state") or "").lower()
+                secs_to_end = ctx.get("secs_to_game_end")
+                espn_is_live = (state == "in" and secs_to_end is not None)
+
                 espn_wp = ctx.get("espn_live_win_pct")
                 game_progress = ctx.get("game_progress")
                 secs_to_tip = ctx.get("secs_to_tip")
@@ -1394,22 +1454,22 @@ class GameRunner:
                 why = ctx.get("why", "espn")
 
                 if game_secs is not None:
-                    return min(kalshi_secs, float(game_secs)), f"espn:{why}", espn_wp, game_progress, secs_to_tip
+                    return min(kalshi_secs, float(game_secs)), f"espn:{why}", espn_wp, game_progress, secs_to_tip, espn_is_live
 
                 # pregame: we still return kalshi_secs (placeholder), but expose secs_to_tip
-                return kalshi_secs, f"espn:{why}", espn_wp, game_progress, secs_to_tip
+                return kalshi_secs, f"espn:{why}", espn_wp, game_progress, secs_to_tip, espn_is_live
 
             except Exception:
                 pass
 
-        return kalshi_secs, "kalshi", espn_wp, game_progress, secs_to_tip
+        return kalshi_secs, "kalshi", espn_wp, game_progress, secs_to_tip, False
 
     def run(self) -> Dict[str, Any]:
         print_status(f"[{self.label}] Starting — Strategies: {[s.name for s in self.strategies]}")
         print_status(f"[{self.label}] Close: {self.close_time}")
 
         while True:
-            secs_to_close, clock_source, espn_wp, game_progress, secs_to_tip = self._get_secs_to_close()
+            secs_to_close, clock_source, espn_wp, game_progress, secs_to_tip, espn_is_live = self._get_secs_to_close()
 
             if secs_to_close <= 0:
                 print_status(f"[{self.label}] Market closed")
@@ -1477,6 +1537,7 @@ class GameRunner:
             self._settlement_pnl_warning(prices, int(secs_to_close))
 
             context = {
+                "espn_is_live": espn_is_live,
                 "secs_to_close": secs_to_close,
                 "market_quality_ok": mq_ok,
                 "espn_live_win_pct": espn_wp,     # 0..1 or None

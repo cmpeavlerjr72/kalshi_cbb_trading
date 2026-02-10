@@ -39,11 +39,41 @@ from combo_vnext import (
 )
 
 from espn_game_clock import EspnGameClock
-from production_strategies import MeanReversionStrategy, GameRunner
+from production_strategies import MeanReversionStrategy, PregameAnchoredStrategy, GameRunner
+
 
 # --------------------------------------------------------------------------------------
 # Optional: Cloudflare R2 uploader (S3-compatible via boto3)
 # --------------------------------------------------------------------------------------
+from pathlib import Path
+import re
+from datetime import datetime
+
+LOG_ROOT = Path(os.getenv("KALSHI_LOG_ROOT", "kalshi-logs"))
+
+def safe_name(s: str) -> str:
+    s = s.strip().replace(" ", "_")
+    return re.sub(r"[^A-Za-z0-9_\-]", "", s)
+
+def build_game_log_dir(
+    *,
+    sport: str,
+    event: str,
+    game_label: str,
+    game_date: str,   # YYYYMMDD or YYYY-MM-DD
+) -> Path:
+    if len(game_date) == 8:  # YYYYMMDD
+        game_date = f"{game_date[:4]}-{game_date[4:6]}-{game_date[6:]}"
+    return (
+        LOG_ROOT
+        / "kalshi"
+        / safe_name(sport)
+        / safe_name(event)
+        / game_date
+        / safe_name(game_label)
+    )
+
+
 def _safe_import_boto3():
     try:
         import boto3  # type: ignore
@@ -423,26 +453,42 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
 
         espn_clock = setup_espn_clock(game_config)
 
-        # NEW: wait until game is live before creating runner (so trading/logging starts at live)
-        if not wait_for_espn_live(label, espn_clock):
-            results[label] = {"skipped": True, "reason": "espn_never_went_live"}
-            return
-
         preferred_side = "yes" if float(game_config["model_p_win"]) >= 0.50 else "no"
 
         strategies = [
+            # Pregame: maker anchor until ESPN goes live
+            PregameAnchoredStrategy(
+                max_capital=float(game_config["allocation"]),
+                model_fair_cents=int(float(game_config["model_p_win"]) * 100),
+                partner_fair_cents=int(float(game_config.get("partner_p_win", game_config["model_p_win"])) * 100),
+                cushion_cents=int(os.getenv("PREGAME_CUSHION_CENTS") or "6"),
+                market_weight=float(os.getenv("PREGAME_MARKET_WEIGHT") or "0.70"),
+                model_share=float(os.getenv("PREGAME_MODEL_SHARE") or "0.50"),
+            ),
+
+            # Live: MR (will still be allowed, but you can optionally gate entries to live only later)
             MeanReversionStrategy(
                 max_capital=float(game_config["allocation"]),
                 preferred_side=preferred_side,
             ),
         ]
 
+
         print_status(
-            f"[{label}] Strategy: MR ONLY | "
+            f"[{label}] Strategies: PREGAME_ANCHORED + MEAN_REVERSION | "
             f"Alloc:${game_config['allocation']:.2f} | "
             f"Preferred:{preferred_side.upper()} | "
             f"ModelFair:{int(float(game_config['model_p_win'])*100)}c"
         )
+
+        log_dir = build_game_log_dir(
+            sport=str(game_config.get("sport") or "cbb"),
+            event=str(game_config.get("event") or "game"),
+            game_label=label,
+            game_date=str(game_config.get("espn_date") or utc_now().strftime("%Y%m%d")),
+        )
+        log_dir.mkdir(parents=True, exist_ok=True)
+
 
         runner = GameRunner(
             game_label=label,
@@ -451,7 +497,9 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
             strategies=strategies,
             private_key=private_key,
             espn_clock=espn_clock,
+            log_dir=str(log_dir),
         )
+
 
         summary = runner.run()
         results[label] = summary
@@ -551,9 +599,10 @@ def main() -> int:
     for i, g in enumerate(games, 1):
         print_status(f"  {i}. {g.get('label')} | team={g.get('team_name')} | p={g.get('model_p_win')}")
 
-    # R2 uploader (optional)
-    logs_dir = Path("logs").resolve()
-    uploader = R2Uploader(local_logs_dir=logs_dir)
+    # R2 uploader (optional) — sync the whole kalshi-logs tree
+    LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    uploader = R2Uploader(local_logs_dir=LOG_ROOT)
+
 
     stop = StopFlag()
 
@@ -648,7 +697,8 @@ def main() -> int:
             "results": results,
         }
         ts = utc_now().strftime("%Y%m%d_%H%M%S")
-        out = Path("logs") / f"cloud_aggregate_summary_{ts}.json"
+        out = LOG_ROOT / f"cloud_aggregate_summary_{ts}.json"
+
         out.write_text(json.dumps(agg, indent=2, default=str), encoding="utf-8")
         print_status(f"[AGG] Wrote {out}")
     except Exception as e:
