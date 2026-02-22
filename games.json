@@ -1,42 +1,22 @@
 [
 {
-    "label": "Milwaukee at IU Indy",
-    "team_name": "MILW",
+    "label": "Northern Kentucky at Youngstown St.",
+    "team_name": "NKU",
     "model_p_win": 0.51,
     "partner_p_win":0.51,
     "segment": "Home Fav",
-    "espn_date": "20260210",
-    "espn_team": "MILW",
-    "espn_opponent": "IUIN"
+    "espn_date": "20260222",
+    "espn_team": "NKU",
+    "espn_opponent": "YSU"
 },
 {
-    "label": "Vanderbilt at Auburn",
-    "team_name": "VAN",
+    "label": "Milwaukee at Oakland",
+    "team_name": "OAK",
     "model_p_win": 0.55,
     "partner_p_win":0.55,
     "segment": "Home Fav",
-    "espn_date": "20260210",
-    "espn_team": "VAN",
-    "espn_opponent": "AUB"
-},
-{
-    "label": "North Carolina at Miami (FL)",
-    "team_name": "MIA",
-    "model_p_win": 0.51,
-    "partner_p_win":0.51,
-    "segment": "Home Fav",
-    "espn_date": "20260210",
-    "espn_team": "MIA",
-    "espn_opponent": "UNC"
-},
-{
-    "label": "Purdue at Nebraska",
-    "team_name": "NEB",
-    "model_p_win": 0.52,
-    "partner_p_win":0.52,
-    "segment": "Away Dog",
-    "espn_date": "20260210",
-    "espn_team": "NEB",
-    "espn_opponent": "PUR"
+    "espn_date": "20260222",
+    "espn_team": "OAK",
+    "espn_opponent": "MILW"
 }
 ]
