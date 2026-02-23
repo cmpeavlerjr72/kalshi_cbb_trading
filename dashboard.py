@@ -96,10 +96,62 @@ def list_prefixes(prefix: str):
     return result
 
 
+def _list_flat_files():
+    """
+    List all flat files directly under R2_PREFIX/ (the old log format).
+    Returns list of (key, filename) tuples.
+    Cached for the TTL period.
+    """
+    cache_key = "__flat_files__"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = []
+    try:
+        s3 = get_s3_client()
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(
+            Bucket=R2_BUCKET, Prefix=f"{R2_PREFIX}/", Delimiter="/"
+        ):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                name = key.rsplit("/", 1)[-1]
+                result.append((key, name))
+    except Exception as e:
+        print(f"[dashboard] _list_flat_files error: {e}")
+
+    _cache.put(cache_key, result)
+    return result
+
+
+def _parse_flat_filename(name: str):
+    """
+    Parse old-format flat filenames like:
+      multistrat_Belmont at Bradley_20260210_010528_snapshots.csv
+    Returns (game_label, date_str, file_type) or None.
+    file_type is one of: snapshots, trades, positions, events
+    """
+    import re
+    # Pattern: multistrat_{game}_{YYYYMMDD}_{HHMMSS}_{type}.csv
+    # Also: summary_{game}_{date}_{time}.json (skip these)
+    m = re.match(
+        r"multistrat_(.+?)_(\d{8})_(\d{6})_(snapshots|trades|positions|events)\.csv$",
+        name,
+    )
+    if not m:
+        return None
+    game_label = m.group(1)
+    raw_date = m.group(2)
+    date_str = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}"
+    file_type = m.group(4)
+    return game_label, date_str, file_type
+
+
 def discover_dates():
     """
-    Walk R2 prefix hierarchy to find date folders.
-    Structure: {R2_PREFIX}/kalshi/{sport}/{event}/{date}/
+    Walk R2 prefix hierarchy to find date folders (new format)
+    AND scan flat filenames (old format).
     Returns list of date strings like '2026-02-23'.
     """
     cache_key = "__dates__"
@@ -108,6 +160,8 @@ def discover_dates():
         return cached
 
     dates = set()
+
+    # New format: nested folders
     try:
         base = f"{R2_PREFIX}/kalshi"
         sports = list_prefixes(base)
@@ -119,18 +173,41 @@ def discover_dates():
                     if len(d) == 10 and d[4] == "-":
                         dates.add(d)
     except Exception as e:
-        print(f"[dashboard] discover_dates error: {e}")
+        print(f"[dashboard] discover_dates (nested) error: {e}")
+
+    # Old format: flat files
+    try:
+        for key, name in _list_flat_files():
+            parsed = _parse_flat_filename(name)
+            if parsed:
+                dates.add(parsed[1])
+    except Exception as e:
+        print(f"[dashboard] discover_dates (flat) error: {e}")
 
     result = sorted(dates, reverse=True)
     _cache.put(cache_key, result)
     return result
 
 
+def _has_csv_files(prefix: str) -> bool:
+    """Check if there are CSV files directly under a prefix (not in subfolders)."""
+    try:
+        s3 = get_s3_client()
+        resp = s3.list_objects_v2(
+            Bucket=R2_BUCKET, Prefix=f"{prefix}/snapshots.csv", MaxKeys=1
+        )
+        return resp.get("KeyCount", 0) > 0
+    except Exception:
+        return False
+
+
 def discover_games(date_str: str):
     """
-    Find game dirs and their ticker sub-dirs for a given date.
-    Returns: [{"game": "Louisville_at_North_Carolina", "tickers": ["LOU", "LOU2", ...],
-               "prefix": "kalshi/logs/kalshi/cbb/game/2026-02-23/Louisville_at_North_Carolina"}, ...]
+    Find games for a given date. Handles three R2 layouts:
+      1. NEW nested:  .../game_label/TICKER/snapshots.csv  (multi-ticker)
+      2. OLD nested:  .../game_label/snapshots.csv          (single-ticker in folder)
+      3. OLD flat:    kalshi/logs/multistrat_{game}_{date}_{time}_snapshots.csv
+    Returns: [{"game": "...", "tickers": [...], "prefix": "...", ...}, ...]
     """
     cache_key = f"__games__{date_str}"
     cached = _cache.get(cache_key)
@@ -138,6 +215,9 @@ def discover_games(date_str: str):
         return cached
 
     games = []
+    seen_games = set()  # avoid duplicates between nested and flat
+
+    # --- 1 & 2: Nested folder format ---
     try:
         base = f"{R2_PREFIX}/kalshi"
         sports = list_prefixes(base)
@@ -151,13 +231,55 @@ def discover_games(date_str: str):
                 for game in game_dirs:
                     game_prefix = f"{base}/{sport}/{event}/{date_str}/{game}"
                     tickers = list_prefixes(game_prefix)
-                    games.append({
-                        "game": game,
-                        "tickers": sorted(tickers),
-                        "prefix": game_prefix,
-                    })
+
+                    if tickers:
+                        # New format: ticker subfolders exist
+                        games.append({
+                            "game": game,
+                            "tickers": sorted(tickers),
+                            "prefix": game_prefix,
+                        })
+                        seen_games.add(game)
+                    elif _has_csv_files(game_prefix):
+                        # Old nested: CSVs directly in game folder
+                        games.append({
+                            "game": game,
+                            "tickers": ["_root"],
+                            "prefix_override": game_prefix,
+                        })
+                        seen_games.add(game)
     except Exception as e:
-        print(f"[dashboard] discover_games error: {e}")
+        print(f"[dashboard] discover_games (nested) error: {e}")
+
+    # --- 3: Flat file format ---
+    try:
+        # Group flat files by (game_label, date) -> {type: r2_key}
+        flat_games = {}  # game_label -> {snapshots: key, trades: key, ...}
+        for key, name in _list_flat_files():
+            parsed = _parse_flat_filename(name)
+            if not parsed:
+                continue
+            game_label, file_date, file_type = parsed
+            if file_date != date_str:
+                continue
+            if game_label not in flat_games:
+                flat_games[game_label] = {}
+            flat_games[game_label][file_type] = key
+
+        for game_label, files in flat_games.items():
+            # Skip if already found in nested format
+            game_key = game_label.replace(" ", "_")
+            if game_key in seen_games:
+                continue
+            if "snapshots" not in files:
+                continue
+            games.append({
+                "game": game_key,
+                "tickers": ["_flat"],
+                "flat_files": files,
+            })
+    except Exception as e:
+        print(f"[dashboard] discover_games (flat) error: {e}")
 
     _cache.put(cache_key, games)
     return games
@@ -443,11 +565,39 @@ def build_dashboard_data(date_str: str):
         all_closed_stats = []
 
         for ticker_label in game_info["tickers"]:
-            prefix = f"{game_info['prefix']}/{ticker_label}"
-            snapshots = fetch_csv_from_r2(f"{prefix}/snapshots.csv")
-            trades = fetch_csv_from_r2(f"{prefix}/trades.csv")
-            positions = fetch_csv_from_r2(f"{prefix}/positions.csv")
-            events = fetch_csv_from_r2(f"{prefix}/events.csv")
+            # Determine how to fetch CSVs based on format
+            if ticker_label == "_flat" and "flat_files" in game_info:
+                # Old flat format: individual R2 keys per file type
+                ff = game_info["flat_files"]
+                snapshots = fetch_csv_from_r2(ff["snapshots"]) if "snapshots" in ff else []
+                trades = fetch_csv_from_r2(ff["trades"]) if "trades" in ff else []
+                positions = fetch_csv_from_r2(ff["positions"]) if "positions" in ff else []
+                events = fetch_csv_from_r2(ff["events"]) if "events" in ff else []
+            elif ticker_label == "_root" and "prefix_override" in game_info:
+                # Old nested format: CSVs directly in game folder
+                csv_prefix = game_info["prefix_override"]
+                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv")
+                trades = fetch_csv_from_r2(f"{csv_prefix}/trades.csv")
+                positions = fetch_csv_from_r2(f"{csv_prefix}/positions.csv")
+                events = fetch_csv_from_r2(f"{csv_prefix}/events.csv")
+            else:
+                # New format: ticker subfolder
+                csv_prefix = f"{game_info['prefix']}/{ticker_label}"
+                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv")
+                trades = fetch_csv_from_r2(f"{csv_prefix}/trades.csv")
+                positions = fetch_csv_from_r2(f"{csv_prefix}/positions.csv")
+                events = fetch_csv_from_r2(f"{csv_prefix}/events.csv")
+
+            # For old formats, derive a display label from the ticker column in CSV
+            if ticker_label in ("_root", "_flat") and snapshots:
+                raw_ticker = snapshots[0].get("ticker", "")
+                # e.g. "KXNCAAMBGAME-26FEB10SIUINST-SIU" -> "SIU"
+                ticker_label = raw_ticker.rsplit("-", 1)[-1] if "-" in raw_ticker else game_info["game"]
+            elif ticker_label in ("_root", "_flat"):
+                # No snapshot data at all — skip this empty ticker
+                if not trades and not positions and not events:
+                    continue
+                ticker_label = game_info["game"]
 
             # Latest snapshot for this ticker
             latest_snap = snapshots[-1] if snapshots else {}
@@ -530,7 +680,9 @@ def build_dashboard_data(date_str: str):
         game_data["open_positions"] = all_open_positions
         game_data["closed_stats"] = all_closed_stats
         game_data["events"] = game_data["events"][-20:]
-        result["games"].append(game_data)
+        # Skip games with no data at all
+        if game_data["tickers"] or game_data["events"]:
+            result["games"].append(game_data)
 
     result["portfolio"]["total_pnl"] = (
         result["portfolio"]["realized"] + result["portfolio"]["unrealized"]
