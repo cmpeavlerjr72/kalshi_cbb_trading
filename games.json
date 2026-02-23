@@ -4,7 +4,7 @@
     "team_name": "LOU",
     "model_p_win": 0.57,
     "partner_p_win": 0.57,
-    "segment": "Home Fav",
+    "segment": "Away Fav",
     "espn_date": "20260223",
     "espn_team": "LOU",
     "espn_opponent": "UNC",
@@ -12,6 +12,111 @@
       "KXNCAAMBSPREAD-26FEB23LOUUNC-LOU2",
       "KXNCAAMBSPREAD-26FEB23LOUUNC-LOU5",
       "KXNCAAMBSPREAD-26FEB23LOUUNC-UNC1"
+    ]
+  },
+  {
+    "label": "Nicholls at Lamar",
+    "team_name": "LAM",
+    "model_p_win": 0.53,
+    "partner_p_win": 0.53,
+    "segment": "Home Fav",
+    "espn_date": "20260223",
+    "espn_team": "LAM",
+    "espn_opponent": "NICH",
+    "spread_tickers": [
+      "KXNCAAMBSPREAD-26FEB23NICHLAM-LAM1",
+      "KXNCAAMBSPREAD-26FEB23NICHLAM-LAM4",
+      "KXNCAAMBSPREAD-26FEB23NICHLAM-NICH2"
+    ]
+  },
+  {
+    "label": "TX A&M-CC at SE Louisiana",
+    "team_name": "AMCC",
+    "model_p_win": 0.59,
+    "partner_p_win": 0.59,
+    "segment": "Away Fav",
+    "espn_date": "20260223",
+    "espn_team": "AMCC",
+    "espn_opponent": "SELA",
+    "spread_tickers": [
+      "KXNCAAMBSPREAD-26FEB23AMCCSELA-AMCC2",
+      "KXNCAAMBSPREAD-26FEB23AMCCSELA-AMCC5",
+      "KXNCAAMBSPREAD-26FEB23AMCCSELA-SELA1"
+    ]
+  },
+  {
+    "label": "Houston Christian at East Texas A&M",
+    "team_name": "ETAM",
+    "model_p_win": 0.52,
+    "partner_p_win": 0.52,
+    "segment": "Home Fav",
+    "espn_date": "20260223",
+    "espn_team": "ETAM",
+    "espn_opponent": "HCU",
+    "spread_tickers": [
+      "KXNCAAMBSPREAD-26FEB23HCUETAM-ETAM2",
+      "KXNCAAMBSPREAD-26FEB23HCUETAM-ETAM5",
+      "KXNCAAMBSPREAD-26FEB23HCUETAM-HCU1"
+    ]
+  },
+  {
+    "label": "Incarnate Word at Northwestern St.",
+    "team_name": "IW",
+    "model_p_win": 0.53,
+    "partner_p_win": 0.53,
+    "segment": "Away Fav",
+    "espn_date": "20260223",
+    "espn_team": "UIW",
+    "espn_opponent": "NWST",
+    "spread_tickers": [
+      "KXNCAAMBSPREAD-26FEB23IWNWST-IW1",
+      "KXNCAAMBSPREAD-26FEB23IWNWST-IW4",
+      "KXNCAAMBSPREAD-26FEB23IWNWST-NWST2"
+    ]
+  },
+  {
+    "label": "UTRGV at McNeese",
+    "team_name": "MCNS",
+    "model_p_win": 0.64,
+    "partner_p_win": 0.64,
+    "segment": "Home Fav",
+    "espn_date": "20260223",
+    "espn_team": "MCN",
+    "espn_opponent": "RGV",
+    "spread_tickers": [
+      "KXNCAAMBSPREAD-26FEB23UTRGVMCNS-MCNS4",
+      "KXNCAAMBSPREAD-26FEB23UTRGVMCNS-MCNS7",
+      "KXNCAAMBSPREAD-26FEB23UTRGVMCNS-UTRGV2"
+    ]
+  },
+  {
+    "label": "New Orleans at SF Austin",
+    "team_name": "SFA",
+    "model_p_win": 0.74,
+    "partner_p_win": 0.74,
+    "segment": "Home Fav",
+    "espn_date": "20260223",
+    "espn_team": "SFA",
+    "espn_opponent": "UNO",
+    "spread_tickers": [
+      "KXNCAAMBSPREAD-26FEB23UNOSFA-SFA10",
+      "KXNCAAMBSPREAD-26FEB23UNOSFA-SFA13",
+      "KXNCAAMBSPREAD-26FEB23UNOSFA-UNO2"
+    ]
+  },
+  {
+    "label": "Houston at Kansas",
+    "team_name": "HOU",
+    "model_p_win": 0.68,
+    "partner_p_win": 0.68,
+    "segment": "Away Fav",
+    "espn_date": "20260223",
+    "espn_team": "HOU",
+    "espn_opponent": "KU",
+    "spread_tickers": [
+      "KXNCAAMBSPREAD-26FEB23HOUKU-HOU7",
+      "KXNCAAMBSPREAD-26FEB23HOUKU-HOU10",
+      "KXNCAAMBSPREAD-26FEB23HOUKU-KU2"
     ]
   }
 ]

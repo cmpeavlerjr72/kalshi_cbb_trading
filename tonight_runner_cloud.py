@@ -42,8 +42,6 @@ from combo_vnext import (
 from espn_game_clock import EspnGameClock
 from production_strategies import (
     MeanReversionStrategy,
-    PairedMeanReversionStrategy,
-    FinalMinutesStrategy,
     ExposureTracker,
     GameRunner,
 )
@@ -478,6 +476,8 @@ def _run_sub_ticker(
     espn_clock,
     log_dir: Path,
     sub_results: Dict[str, Any],
+    maker_entries: bool = False,
+    min_entry_price: int = 0,
 ):
     """Run a single GameRunner for one ticker. Called in its own thread."""
     try:
@@ -492,6 +492,8 @@ def _run_sub_ticker(
             private_key=private_key,
             espn_clock=espn_clock,
             log_dir=str(sub_log_dir),
+            maker_entries=maker_entries,
+            min_entry_price=min_entry_price,
         )
 
         summary = runner.run()
@@ -540,7 +542,11 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
 
         n_tickers = len(ticker_configs)
         total_alloc = float(game_config["allocation"])
-        per_ticker_alloc = total_alloc / max(1, n_tickers)
+
+        # 50/50 ML vs spread split — ML gets half, spreads share the other half
+        n_spread_tickers = sum(1 for _, _, _, is_sp in ticker_configs if is_sp)
+        ml_alloc = total_alloc * 0.50
+        spread_alloc_each = (total_alloc * 0.50 / max(1, n_spread_tickers)) if n_spread_tickers else 0.0
 
         # --- Shared ExposureTracker (thread-safe, caps total game exposure) ---
         exposure = ExposureTracker(max_exposure_dollars=total_alloc)
@@ -556,7 +562,7 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
 
         print_status(
             f"[{label}] {n_tickers} ticker(s) | "
-            f"TotalAlloc:${total_alloc:.2f} | Per-ticker:${per_ticker_alloc:.2f} | "
+            f"TotalAlloc:${total_alloc:.2f} | ML:${ml_alloc:.2f} Spread×{n_spread_tickers}:${spread_alloc_each:.2f}ea | "
             f"Preferred:{preferred_side.upper()}"
         )
 
@@ -581,53 +587,21 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
             else:
                 ticker_preferred = preferred_side
 
-            # --- Strategy split per ticker type ---
-            if is_spread:
-                # Spread: PairedMR 60%, MR 40% (no FinalMinutes)
-                paired_alloc = per_ticker_alloc * 0.60
-                mr_alloc = per_ticker_alloc * 0.40
-                strategies = [
-                    PairedMeanReversionStrategy(
-                        max_capital=paired_alloc,
-                        preferred_side=ticker_preferred,
-                        exposure_tracker=exposure,
-                    ),
-                    MeanReversionStrategy(
-                        max_capital=mr_alloc,
-                        preferred_side=ticker_preferred,
-                        exposure_tracker=exposure,
-                    ),
-                ]
-                print_status(
-                    f"[{label}/{ticker_label}] SPREAD | "
-                    f"PairedMR:${paired_alloc:.2f} MR:${mr_alloc:.2f} | "
-                    f"Preferred:{ticker_preferred.upper()}"
-                )
-            else:
-                # ML: PairedMR 50%, MR 30%, FinalMinutes 20%
-                paired_alloc = per_ticker_alloc * 0.50
-                mr_alloc = per_ticker_alloc * 0.30
-                final_alloc = per_ticker_alloc * 0.20
-                strategies = [
-                    PairedMeanReversionStrategy(
-                        max_capital=paired_alloc,
-                        preferred_side=ticker_preferred,
-                        exposure_tracker=exposure,
-                    ),
-                    MeanReversionStrategy(
-                        max_capital=mr_alloc,
-                        preferred_side=ticker_preferred,
-                        exposure_tracker=exposure,
-                    ),
-                    FinalMinutesStrategy(
-                        max_capital=final_alloc,
-                    ),
-                ]
-                print_status(
-                    f"[{label}/{ticker_label}] ML | "
-                    f"PairedMR:${paired_alloc:.2f} MR:${mr_alloc:.2f} Final:${final_alloc:.2f} | "
-                    f"Preferred:{ticker_preferred.upper()}"
-                )
+            # --- Strategy: MR-only with maker entries + min price filter ---
+            ticker_alloc = spread_alloc_each if is_spread else ml_alloc
+            strategies = [
+                MeanReversionStrategy(
+                    max_capital=ticker_alloc,
+                    preferred_side=ticker_preferred,
+                    exposure_tracker=exposure,
+                ),
+            ]
+            ticker_type = "SPREAD" if is_spread else "ML"
+            print_status(
+                f"[{label}/{ticker_label}] {ticker_type} | "
+                f"MR:${ticker_alloc:.2f} [maker+mp20] | "
+                f"Preferred:{ticker_preferred.upper()}"
+            )
 
             t = threading.Thread(
                 target=_run_sub_ticker,
@@ -641,6 +615,8 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
                     espn_clock=espn_clock,
                     log_dir=log_dir,
                     sub_results=sub_results,
+                    maker_entries=True,
+                    min_entry_price=20,
                 ),
                 name=f"{label}/{ticker_label}",
                 daemon=False,
@@ -710,7 +686,7 @@ def main() -> int:
     setup_workdir()
 
     print("\n" + "=" * 80)
-    print("  PRODUCTION WORKER RUNNER (CLOUD) — PAIRED MR + MR + FINAL MINUTES")
+    print("  PRODUCTION WORKER RUNNER (CLOUD) — MR-ONLY + MAKER ENTRIES + MP20")
     print("  Output: ./logs locally + optional R2 sync")
     print("=" * 80)
 

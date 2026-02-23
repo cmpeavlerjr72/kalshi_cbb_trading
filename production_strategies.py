@@ -1356,6 +1356,8 @@ class GameRunner:
         private_key,
         espn_clock=None,
         log_dir: Optional[str] = None,
+        maker_entries: bool = False,
+        min_entry_price: int = 0,
     ):
         self.label = game_label
         self.ticker = ticker
@@ -1364,6 +1366,8 @@ class GameRunner:
         self.private_key = private_key
         self.close_time = parse_iso(market["close_time"])
         self.espn_clock = espn_clock
+        self.maker_entries = maker_entries
+        self.min_entry_price = min_entry_price
 
         # P3: Market quality monitor
         self.quality = MarketQualityMonitor(warmup_samples=40, warmup_secs=180)
@@ -1485,37 +1489,54 @@ class GameRunner:
     def _execute_entry(self, strategy: BaseStrategy, side: str, price: int, qty: int, reason: str,
                     context: Dict[str, Any]):
 
-        print_status(f"[{self.label}][{strategy.name}] ENTRY {side.upper()} {qty}x @ {price}c — {reason}")
-        self._log_event(strategy.name, "entry_attempt", f"{side} {qty}x@{price}c {reason}")
+        mode = "maker" if self.maker_entries else "taker"
+        print_status(f"[{self.label}][{strategy.name}] ENTRY [{mode}] {side.upper()} {qty}x @ {price}c — {reason}")
+        self._log_event(strategy.name, f"entry_attempt_{mode}", f"{side} {qty}x@{price}c {reason}")
 
         try:
-            # Liquidity check before sending order
             ob = fetch_orderbook(self.ticker)
-
             px = derive_prices(ob)
-            if not has_fill_liquidity_for_implied_buy(px, side, price, min_qty=max(MIN_LIQUIDITY_CONTRACTS, qty)):
-                print_status(f"[{self.label}][{strategy.name}] SKIP — no liquidity for {side} @{price}c")
-                self._log_event(strategy.name, "entry_skip_liquidity", f"{side}@{price}c")
-                return None
 
+            if self.maker_entries:
+                # Maker mode: place order 1c below implied ask so it rests on the book
+                maker_price = price - 1
+                fresh_ask = px.get("imp_yes_ask") if side == "yes" else px.get("imp_no_ask")
+                if fresh_ask is None or maker_price >= int(fresh_ask):
+                    print_status(f"[{self.label}][{strategy.name}] SKIP maker — spread=0 or no ask (price={maker_price}c ask={fresh_ask})")
+                    self._log_event(strategy.name, "entry_skip_maker_spread0", f"{side}@{maker_price}c ask={fresh_ask}")
+                    return None
+                price = maker_price
+            else:
+                # Taker mode: liquidity check before sending order
+                if not has_fill_liquidity_for_implied_buy(px, side, price, min_qty=max(MIN_LIQUIDITY_CONTRACTS, qty)):
+                    print_status(f"[{self.label}][{strategy.name}] SKIP — no liquidity for {side} @{price}c")
+                    self._log_event(strategy.name, "entry_skip_liquidity", f"{side}@{price}c")
+                    return None
 
             order_id = place_limit_buy(self.private_key, self.ticker, side, price, qty)
-            wait_secs = int(strategy.entry_wait_secs(context) or 15)
+            wait_secs = 45 if self.maker_entries else int(strategy.entry_wait_secs(context) or 15)
             filled, vwap = wait_for_fill_or_timeout(self.private_key, order_id, side, max_wait_secs=wait_secs)
-
 
             if filled > 0:
                 actual = vwap if vwap else float(price)
                 pos = strategy.record_entry(side, actual, filled, reason)
-                fee = calc_taker_fee(int(actual), filled)
-                print_status(f"[{self.label}][{strategy.name}] FILLED {filled}x @ {actual:.1f}c")
+
+                if self.maker_entries:
+                    # Maker orders have 0 fee — correct the taker fee recorded by record_entry
+                    strategy.total_fees -= pos.entry_fee
+                    pos.entry_fee = 0.0
+                    fee = 0.0
+                else:
+                    fee = calc_taker_fee(int(actual), filled)
+
+                print_status(f"[{self.label}][{strategy.name}] FILLED [{mode}] {filled}x @ {actual:.1f}c (fee={fee:.1f}c)")
                 strategy.on_entry_result(True, context)
-                self._log_trade(strategy.name, "entry_fill", side, price, actual, filled, fee, reason, order_id)
+                self._log_trade(strategy.name, f"entry_fill_{mode}", side, price, actual, filled, fee, reason, order_id)
                 return pos
             else:
-                print_status(f"[{self.label}][{strategy.name}] NO FILL")
+                print_status(f"[{self.label}][{strategy.name}] NO FILL [{mode}]")
                 strategy.on_entry_result(False, context)
-                self._log_trade(strategy.name, "entry_nofill", side, price, 0, 0, 0, reason, order_id)
+                self._log_trade(strategy.name, f"entry_nofill_{mode}", side, price, 0, 0, 0, reason, order_id)
                 return None
 
         except Exception as e:
@@ -1784,7 +1805,11 @@ class GameRunner:
                         prices, int(secs_to_close), context
                     )
                     if should_enter:
-                        self._execute_entry(strategy, side, price, qty, reason, context)
+                        if self.min_entry_price > 0 and price < self.min_entry_price:
+                            self._log_event(strategy.name, "entry_skip_min_price",
+                                           f"{side}@{price}c<min={self.min_entry_price}c")
+                        else:
+                            self._execute_entry(strategy, side, price, qty, reason, context)
 
 
             time.sleep(POLL_INTERVAL_SECS)

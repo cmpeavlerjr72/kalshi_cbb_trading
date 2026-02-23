@@ -549,6 +549,14 @@ def build_dashboard_data(date_str: str):
             "wins": 0,
             "losses": 0,
         },
+        "ml_vs_spread": {
+            "ml_realized": 0.0,
+            "ml_unrealized": 0.0,
+            "ml_total": 0.0,
+            "spread_realized": 0.0,
+            "spread_unrealized": 0.0,
+            "spread_total": 0.0,
+        },
         "fetch_time": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -680,6 +688,20 @@ def build_dashboard_data(date_str: str):
         game_data["open_positions"] = all_open_positions
         game_data["closed_stats"] = all_closed_stats
         game_data["events"] = game_data["events"][-20:]
+
+        # Per-game ML vs Spread aggregation
+        ml_real = sum(t["realized"] for t in game_data["tickers"] if t["type"] == "ML")
+        ml_unreal = sum(t["unrealized"] for t in game_data["tickers"] if t["type"] == "ML")
+        sp_real = sum(t["realized"] for t in game_data["tickers"] if t["type"] == "Spread")
+        sp_unreal = sum(t["unrealized"] for t in game_data["tickers"] if t["type"] == "Spread")
+        game_data["ml_pnl"] = {"realized": ml_real, "unrealized": ml_unreal, "total": ml_real + ml_unreal}
+        game_data["spread_pnl"] = {"realized": sp_real, "unrealized": sp_unreal, "total": sp_real + sp_unreal}
+
+        # Accumulate into global ML vs Spread
+        result["ml_vs_spread"]["ml_realized"] += ml_real
+        result["ml_vs_spread"]["ml_unrealized"] += ml_unreal
+        result["ml_vs_spread"]["spread_realized"] += sp_real
+        result["ml_vs_spread"]["spread_unrealized"] += sp_unreal
         # Skip games with no meaningful data (empty CSVs / failed runs)
         has_snapshots = any(t.get("mid", 0) != 0 for t in game_data["tickers"])
         has_trades = any(t.get("realized", 0) != 0 or t.get("open_count", 0) > 0 for t in game_data["tickers"])
@@ -694,6 +716,10 @@ def build_dashboard_data(date_str: str):
     result["portfolio"]["win_rate"] = (
         result["portfolio"]["wins"] / total if total > 0 else 0
     )
+
+    mvs = result["ml_vs_spread"]
+    mvs["ml_total"] = mvs["ml_realized"] + mvs["ml_unrealized"]
+    mvs["spread_total"] = mvs["spread_realized"] + mvs["spread_unrealized"]
 
     return result
 
@@ -843,6 +869,21 @@ svg text { font-family:inherit; }
   <div class="stat-card"><div class="label">Unrealized</div><div class="value" id="unrealized">--</div></div>
   <div class="stat-card"><div class="label">Open Positions</div><div class="value neutral" id="openCount">--</div></div>
   <div class="stat-card"><div class="label">Win Rate</div><div class="value neutral" id="winRate">--</div></div>
+</div>
+
+<div class="portfolio" id="mlVsSpread" style="grid-template-columns:repeat(4,1fr);">
+  <div class="stat-card" style="border-left:3px solid var(--blue);">
+    <div class="label"><span class="tag tag-ml">ML</span> Total P&amp;L</div><div class="value" id="mlTotal">--</div>
+  </div>
+  <div class="stat-card" style="border-left:3px solid var(--blue);">
+    <div class="label"><span class="tag tag-ml">ML</span> Realized / Unreal</div><div class="value" id="mlDetail">--</div>
+  </div>
+  <div class="stat-card" style="border-left:3px solid var(--orange);">
+    <div class="label"><span class="tag tag-spread">SPREAD</span> Total P&amp;L</div><div class="value" id="spreadTotal">--</div>
+  </div>
+  <div class="stat-card" style="border-left:3px solid var(--orange);">
+    <div class="label"><span class="tag tag-spread">SPREAD</span> Realized / Unreal</div><div class="value" id="spreadDetail">--</div>
+  </div>
 </div>
 
 <div class="charts">
@@ -1010,6 +1051,25 @@ function renderPortfolio(p) {
   wr.textContent = total > 0 ? (p.win_rate*100).toFixed(0)+'% ('+p.wins+'W-'+p.losses+'L)' : '--';
 }
 
+function renderMlVsSpread(mvs) {
+  if (!mvs) return;
+  const mt = document.getElementById('mlTotal');
+  mt.textContent = fmtCents(mvs.ml_total) + fmtDollars(mvs.ml_total);
+  mt.className = 'value ' + pnlClass(mvs.ml_total);
+
+  const md = document.getElementById('mlDetail');
+  md.textContent = fmtCents(mvs.ml_realized) + ' / ' + fmtCents(mvs.ml_unrealized);
+  md.className = 'value ' + pnlClass(mvs.ml_realized);
+
+  const st = document.getElementById('spreadTotal');
+  st.textContent = fmtCents(mvs.spread_total) + fmtDollars(mvs.spread_total);
+  st.className = 'value ' + pnlClass(mvs.spread_total);
+
+  const sd = document.getElementById('spreadDetail');
+  sd.textContent = fmtCents(mvs.spread_realized) + ' / ' + fmtCents(mvs.spread_unrealized);
+  sd.className = 'value ' + pnlClass(mvs.spread_realized);
+}
+
 function isoToMinutes(iso, refTime) {
   if (!iso) return 0;
   try {
@@ -1044,43 +1104,48 @@ function renderCharts(data) {
   });
   if (refTime === Infinity) refTime = Date.now();
 
-  // P&L chart
+  // P&L chart — show ML total, Spread total, and Portfolio total lines
   let pnlSeries = [];
-  let portfolioPnl = {};
   pnlLegend.innerHTML = '';
 
-  allTickers.forEach((t,idx) => {
-    const c = colorFor(t.label, idx);
-    const points = (t.chart?.pnl_series||[]).map(p => {
-      const x = isoToMinutes(p.time, refTime);
-      // Accumulate into portfolio total
-      if (!portfolioPnl[x]) portfolioPnl[x] = 0;
-      portfolioPnl[x] += p.cum_pnl;
-      return {x, y:p.cum_pnl};
+  let mlCumByTime = {};
+  let spCumByTime = {};
+  let totalCumByTime = {};
+
+  allTickers.forEach(t => {
+    (t.chart?.pnl_series||[]).forEach(p => {
+      const x = isoToMinutes(p.time, refTime).toFixed(2);
+      if (!totalCumByTime[x]) totalCumByTime[x] = 0;
+      totalCumByTime[x] += p.cum_pnl;
+      if (t.type === 'ML') {
+        if (!mlCumByTime[x]) mlCumByTime[x] = 0;
+        mlCumByTime[x] += p.cum_pnl;
+      } else {
+        if (!spCumByTime[x]) spCumByTime[x] = 0;
+        spCumByTime[x] += p.cum_pnl;
+      }
     });
-    if (points.length > 0) {
-      pnlSeries.push({label:t.label, color:c, points, isTotal:false});
-      pnlLegend.innerHTML += '<span class="legend-item"><span class="legend-dot" style="background:'+c+'"></span>'+t.label+'</span>';
-    }
   });
 
+  // ML total line
+  const mlSorted = Object.entries(mlCumByTime).map(([x,y])=>({x:parseFloat(x),y})).sort((a,b)=>a.x-b.x);
+  if (mlSorted.length > 0) {
+    pnlSeries.push({label:'All ML', color:'#58a6ff', points:mlSorted, isTotal:false});
+    pnlLegend.innerHTML += '<span class="legend-item"><span class="legend-dot" style="background:#58a6ff"></span>All ML</span>';
+  }
+
+  // Spread total line
+  const spSorted = Object.entries(spCumByTime).map(([x,y])=>({x:parseFloat(x),y})).sort((a,b)=>a.x-b.x);
+  if (spSorted.length > 0) {
+    pnlSeries.push({label:'All Spread', color:'#d29922', points:spSorted, isTotal:false});
+    pnlLegend.innerHTML += '<span class="legend-item"><span class="legend-dot" style="background:#d29922"></span>All Spread</span>';
+  }
+
   // Portfolio total line
-  if (Object.keys(portfolioPnl).length > 0) {
-    const totalPoints = Object.entries(portfolioPnl).map(([x,y]) => ({x:parseFloat(x),y})).sort((a,b)=>a.x-b.x);
-    // Running sum across all tickers at each time
-    let cumByTime = {};
-    allTickers.forEach(t => {
-      (t.chart?.pnl_series||[]).forEach(p => {
-        const x = isoToMinutes(p.time, refTime).toFixed(2);
-        if (!cumByTime[x]) cumByTime[x] = 0;
-        cumByTime[x] += p.cum_pnl;
-      });
-    });
-    const sorted = Object.entries(cumByTime).map(([x,y])=>({x:parseFloat(x),y})).sort((a,b)=>a.x-b.x);
-    if (sorted.length > 0) {
-      pnlSeries.push({label:'Total', color:'#e6edf3', points:sorted, isTotal:true});
-      pnlLegend.innerHTML += '<span class="legend-item"><span class="legend-dot" style="background:#e6edf3"></span><b>Total</b></span>';
-    }
+  const totalSorted = Object.entries(totalCumByTime).map(([x,y])=>({x:parseFloat(x),y})).sort((a,b)=>a.x-b.x);
+  if (totalSorted.length > 0) {
+    pnlSeries.push({label:'Total', color:'#e6edf3', points:totalSorted, isTotal:true});
+    pnlLegend.innerHTML += '<span class="legend-item"><span class="legend-dot" style="background:#e6edf3"></span><b>Total</b></span>';
   }
 
   pnlEl.innerHTML = buildSVG(pnlSeries, {width:chartW, height:180, showFill:true});
@@ -1126,9 +1191,10 @@ function renderGames(data) {
 
     // Ticker table
     html += '<h3>Tickers</h3>';
-    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>Open</th><th>Realized</th><th>Unrealized</th></tr>';
+    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>Open</th><th>Realized</th><th>Unrealized</th><th>Total</th></tr>';
     (game.tickers||[]).forEach(t => {
       const typeTag = t.type==='ML'?'tag-ml':'tag-spread';
+      const tickTotal = (t.realized||0) + (t.unrealized||0);
       html += '<tr>';
       html += '<td><b>'+t.label+'</b></td>';
       html += '<td><span class="tag '+typeTag+'">'+t.type+'</span></td>';
@@ -1138,8 +1204,36 @@ function renderGames(data) {
       html += '<td>'+t.open_count+'</td>';
       html += '<td class="'+pnlClass(t.realized)+'">'+fmtCents(t.realized)+'</td>';
       html += '<td class="'+pnlClass(t.unrealized)+'">'+fmtCents(t.unrealized)+'</td>';
+      html += '<td class="'+pnlClass(tickTotal)+'"><b>'+fmtCents(tickTotal)+'</b></td>';
       html += '</tr>';
     });
+
+    // ML subtotal row
+    const mlPnl = game.ml_pnl || {realized:0, unrealized:0, total:0};
+    html += '<tr style="border-top:2px solid #1f3a5f;background:#0d1a2d;">';
+    html += '<td colspan="6" style="text-align:right;"><span class="tag tag-ml">ML</span> <b>Subtotal</b></td>';
+    html += '<td class="'+pnlClass(mlPnl.realized)+'">'+fmtCents(mlPnl.realized)+'</td>';
+    html += '<td class="'+pnlClass(mlPnl.unrealized)+'">'+fmtCents(mlPnl.unrealized)+'</td>';
+    html += '<td class="'+pnlClass(mlPnl.total)+'"><b>'+fmtCents(mlPnl.total)+fmtDollars(mlPnl.total)+'</b></td>';
+    html += '</tr>';
+
+    // Spread subtotal row
+    const spPnl = game.spread_pnl || {realized:0, unrealized:0, total:0};
+    html += '<tr style="border-top:2px solid #3b2e1a;background:#1a1508;">';
+    html += '<td colspan="6" style="text-align:right;"><span class="tag tag-spread">SPREAD</span> <b>Subtotal</b></td>';
+    html += '<td class="'+pnlClass(spPnl.realized)+'">'+fmtCents(spPnl.realized)+'</td>';
+    html += '<td class="'+pnlClass(spPnl.unrealized)+'">'+fmtCents(spPnl.unrealized)+'</td>';
+    html += '<td class="'+pnlClass(spPnl.total)+'"><b>'+fmtCents(spPnl.total)+fmtDollars(spPnl.total)+'</b></td>';
+    html += '</tr>';
+
+    // Game total row
+    const gameTotal = mlPnl.total + spPnl.total;
+    html += '<tr style="border-top:2px solid var(--border);background:var(--bg3);">';
+    html += '<td colspan="6" style="text-align:right;"><b>Game Total</b></td>';
+    html += '<td></td><td></td>';
+    html += '<td class="'+pnlClass(gameTotal)+'"><b>'+fmtCents(gameTotal)+fmtDollars(gameTotal)+'</b></td>';
+    html += '</tr>';
+
     html += '</table>';
 
     // Open positions
@@ -1233,6 +1327,7 @@ async function fetchData() {
     const data = await resp.json();
     lastFetchTime = Date.now();
     renderPortfolio(data.portfolio || {});
+    renderMlVsSpread(data.ml_vs_spread || {});
     renderCharts(data);
     renderGames(data);
     updateSync();
