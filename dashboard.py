@@ -751,28 +751,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        params = parse_qs(parsed.query)
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            params = parse_qs(parsed.query)
 
-        if path == "/":
-            self._send_html(DASHBOARD_HTML)
+            if path == "/":
+                self._send_html(DASHBOARD_HTML)
 
-        elif path == "/api/dates":
-            dates = discover_dates()
-            self._send_json({"dates": dates})
+            elif path == "/api/dates":
+                dates = discover_dates()
+                self._send_json({"dates": dates})
 
-        elif path == "/api/data":
-            date_str = params.get("date", [None])[0]
-            if not date_str:
-                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                date_str = today
-            data = build_dashboard_data(date_str)
-            self._send_json(data)
+            elif path == "/api/data":
+                date_str = params.get("date", [None])[0]
+                if not date_str:
+                    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    date_str = today
+                data = build_dashboard_data(date_str)
+                self._send_json(data)
 
-        else:
-            self.send_response(404)
-            self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except BrokenPipeError:
+            pass
 
 
 # =============================================================================
