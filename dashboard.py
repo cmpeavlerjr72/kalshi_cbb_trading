@@ -680,8 +680,11 @@ def build_dashboard_data(date_str: str):
         game_data["open_positions"] = all_open_positions
         game_data["closed_stats"] = all_closed_stats
         game_data["events"] = game_data["events"][-20:]
-        # Skip games with no data at all
-        if game_data["tickers"] or game_data["events"]:
+        # Skip games with no meaningful data (empty CSVs / failed runs)
+        has_snapshots = any(t.get("mid", 0) != 0 for t in game_data["tickers"])
+        has_trades = any(t.get("realized", 0) != 0 or t.get("open_count", 0) > 0 for t in game_data["tickers"])
+        has_charts = any(t.get("chart", {}).get("mid_series") for t in game_data["tickers"])
+        if has_snapshots or has_trades or has_charts:
             result["games"].append(game_data)
 
     result["portfolio"]["total_pnl"] = (
