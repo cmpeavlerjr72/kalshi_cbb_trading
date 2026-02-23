@@ -599,9 +599,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 # =============================================================================
 
 def main():
-    port = int(os.getenv("DASHBOARD_PORT", "8050"))
+    port = int(os.getenv("PORT", os.getenv("DASHBOARD_PORT", "8050")))
     server = HTTPServer(("0.0.0.0", port), DashboardHandler)
-    print(f"Dashboard running at http://localhost:{port}")
+    print(f"Dashboard running on port {port}")
     print("Press Ctrl+C to stop")
     try:
         server.serve_forever()
