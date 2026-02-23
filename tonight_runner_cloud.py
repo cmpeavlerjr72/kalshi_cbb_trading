@@ -32,6 +32,7 @@ from combo_vnext import (
     _load_private_key,
     _get,
     get_markets_in_series,
+    fetch_market,
     parse_iso,
     utc_now,
     print_status,
@@ -39,7 +40,13 @@ from combo_vnext import (
 )
 
 from espn_game_clock import EspnGameClock
-from production_strategies import MeanReversionStrategy, PregameAnchoredStrategy, GameRunner
+from production_strategies import (
+    MeanReversionStrategy,
+    PairedMeanReversionStrategy,
+    FinalMinutesStrategy,
+    ExposureTracker,
+    GameRunner,
+)
 
 
 # --------------------------------------------------------------------------------------
@@ -443,44 +450,102 @@ def wait_for_espn_live(label: str, espn_clock: Optional[EspnGameClock]) -> bool:
         time.sleep(max(5, poll))
 
 
+def _aggregate_sub_results(sub_results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Merge per-ticker runner summaries into one game result.
+
+    Each ticker's strategy names are namespaced (e.g. paired_mr/LOU, mean_reversion/LOU2)
+    so the final report shows per-ticker P&L breakdown.
+    """
+    merged: Dict[str, Any] = {"strategies": {}}
+    for ticker_label, summary in sub_results.items():
+        if "error" in summary:
+            merged["strategies"][f"ERROR/{ticker_label}"] = summary
+            continue
+        for strat_name, stats in summary.get("strategies", {}).items():
+            merged["strategies"][f"{strat_name}/{ticker_label}"] = stats
+    return merged
+
+
+def _run_sub_ticker(
+    *,
+    label: str,
+    ticker_label: str,
+    ticker: str,
+    market: Dict[str, Any],
+    strategies: list,
+    private_key,
+    espn_clock,
+    log_dir: Path,
+    sub_results: Dict[str, Any],
+):
+    """Run a single GameRunner for one ticker. Called in its own thread."""
+    try:
+        sub_log_dir = log_dir / safe_name(ticker_label)
+        sub_log_dir.mkdir(parents=True, exist_ok=True)
+
+        runner = GameRunner(
+            game_label=f"{label}/{ticker_label}",
+            ticker=ticker,
+            market=market,
+            strategies=strategies,
+            private_key=private_key,
+            espn_clock=espn_clock,
+            log_dir=str(sub_log_dir),
+        )
+
+        summary = runner.run()
+        sub_results[ticker_label] = summary
+        print_status(f"[{label}/{ticker_label}] ✓ Complete")
+
+    except Exception as e:
+        print_status(f"[{label}/{ticker_label}] ✗ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sub_results[ticker_label] = {"error": str(e)}
+
+
 def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
     label = game_config["label"]
     try:
         print_status(f"\n[{label}] Initializing...")
 
-        ticker, market = find_market_for_team(private_key, game_config["team_name"])
-        print_status(f"[{label}] Market: {ticker} — {market.get('title', 'N/A')}")
+        # --- Discover ML ticker ---
+        ml_ticker, ml_market = find_market_for_team(private_key, game_config["team_name"])
+        print_status(f"[{label}] ML Market: {ml_ticker} — {ml_market.get('title', 'N/A')}")
 
+        # --- Shared ESPN clock (one instance, cache-safe for multi-thread reads) ---
         espn_clock = setup_espn_clock(game_config)
 
         preferred_side = "yes" if float(game_config["model_p_win"]) >= 0.50 else "no"
 
-        strategies = [
-            # Pregame: maker anchor until ESPN goes live
-            PregameAnchoredStrategy(
-                max_capital=float(game_config["allocation"]),
-                model_fair_cents=int(float(game_config["model_p_win"]) * 100),
-                partner_fair_cents=int(float(game_config.get("partner_p_win", game_config["model_p_win"])) * 100),
-                cushion_cents=int(os.getenv("PREGAME_CUSHION_CENTS") or "6"),
-                market_weight=float(os.getenv("PREGAME_MARKET_WEIGHT") or "0.70"),
-                model_share=float(os.getenv("PREGAME_MODEL_SHARE") or "0.50"),
-            ),
+        # --- Spread tickers (optional — backward compatible) ---
+        spread_tickers = game_config.get("spread_tickers") or []
 
-            # Live: MR (will still be allowed, but you can optionally gate entries to live only later)
-            MeanReversionStrategy(
-                max_capital=float(game_config["allocation"]),
-                preferred_side=preferred_side,
-            ),
-        ]
+        # --- Build ticker list: ML + spreads ---
+        ticker_configs = []  # list of (ticker_label, ticker, market, is_spread)
 
+        # Extract short label from ML ticker (e.g. "LOU" from "KXNCAAMBGAME-...-LOU")
+        ml_label = ml_ticker.rsplit("-", 1)[-1] if "-" in ml_ticker else game_config["team_name"]
+        ticker_configs.append((ml_label, ml_ticker, ml_market, False))
 
-        print_status(
-            f"[{label}] Strategies: PREGAME_ANCHORED + MEAN_REVERSION | "
-            f"Alloc:${game_config['allocation']:.2f} | "
-            f"Preferred:{preferred_side.upper()} | "
-            f"ModelFair:{int(float(game_config['model_p_win'])*100)}c"
-        )
+        for sp_ticker in spread_tickers:
+            try:
+                sp_market = fetch_market(private_key, sp_ticker)
+                sp_label = sp_ticker.rsplit("-", 1)[-1]  # e.g. "LOU2", "UNC1"
+                ticker_configs.append((sp_label, sp_ticker, sp_market, True))
+                print_status(f"[{label}] Spread Market: {sp_ticker} — {sp_market.get('title', 'N/A')}")
+            except Exception as e:
+                print_status(f"[{label}] ⚠ Failed to fetch spread ticker {sp_ticker}: {e}")
 
+        n_tickers = len(ticker_configs)
+        total_alloc = float(game_config["allocation"])
+        per_ticker_alloc = total_alloc / max(1, n_tickers)
+
+        # --- Shared ExposureTracker (thread-safe, caps total game exposure) ---
+        exposure = ExposureTracker(max_exposure_dollars=total_alloc)
+
+        # --- Game log dir (shared parent) ---
         log_dir = build_game_log_dir(
             sport=str(game_config.get("sport") or "cbb"),
             event=str(game_config.get("event") or "game"),
@@ -489,21 +554,108 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
         )
         log_dir.mkdir(parents=True, exist_ok=True)
 
-
-        runner = GameRunner(
-            game_label=label,
-            ticker=ticker,
-            market=market,
-            strategies=strategies,
-            private_key=private_key,
-            espn_clock=espn_clock,
-            log_dir=str(log_dir),
+        print_status(
+            f"[{label}] {n_tickers} ticker(s) | "
+            f"TotalAlloc:${total_alloc:.2f} | Per-ticker:${per_ticker_alloc:.2f} | "
+            f"Preferred:{preferred_side.upper()}"
         )
 
+        # --- Build strategies + spawn sub-threads per ticker ---
+        sub_results: Dict[str, Any] = {}
+        sub_threads: List[threading.Thread] = []
 
-        summary = runner.run()
-        results[label] = summary
-        print_status(f"[{label}] ✓ Complete")
+        for ticker_label, ticker, market, is_spread in ticker_configs:
+            # --- Per-ticker private key (avoids thread-safety surprises) ---
+            key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip()
+            ticker_pk = _load_private_key(key_path)
+
+            # --- preferred_side for spread tickers ---
+            # LOU* suffix → same as ML preferred_side
+            # UNC* (opponent) suffix → flipped
+            if is_spread:
+                team_code = game_config["team_name"].upper()
+                if ticker_label.upper().startswith(team_code):
+                    ticker_preferred = preferred_side
+                else:
+                    ticker_preferred = "no" if preferred_side == "yes" else "yes"
+            else:
+                ticker_preferred = preferred_side
+
+            # --- Strategy split per ticker type ---
+            if is_spread:
+                # Spread: PairedMR 60%, MR 40% (no FinalMinutes)
+                paired_alloc = per_ticker_alloc * 0.60
+                mr_alloc = per_ticker_alloc * 0.40
+                strategies = [
+                    PairedMeanReversionStrategy(
+                        max_capital=paired_alloc,
+                        preferred_side=ticker_preferred,
+                        exposure_tracker=exposure,
+                    ),
+                    MeanReversionStrategy(
+                        max_capital=mr_alloc,
+                        preferred_side=ticker_preferred,
+                        exposure_tracker=exposure,
+                    ),
+                ]
+                print_status(
+                    f"[{label}/{ticker_label}] SPREAD | "
+                    f"PairedMR:${paired_alloc:.2f} MR:${mr_alloc:.2f} | "
+                    f"Preferred:{ticker_preferred.upper()}"
+                )
+            else:
+                # ML: PairedMR 50%, MR 30%, FinalMinutes 20%
+                paired_alloc = per_ticker_alloc * 0.50
+                mr_alloc = per_ticker_alloc * 0.30
+                final_alloc = per_ticker_alloc * 0.20
+                strategies = [
+                    PairedMeanReversionStrategy(
+                        max_capital=paired_alloc,
+                        preferred_side=ticker_preferred,
+                        exposure_tracker=exposure,
+                    ),
+                    MeanReversionStrategy(
+                        max_capital=mr_alloc,
+                        preferred_side=ticker_preferred,
+                        exposure_tracker=exposure,
+                    ),
+                    FinalMinutesStrategy(
+                        max_capital=final_alloc,
+                    ),
+                ]
+                print_status(
+                    f"[{label}/{ticker_label}] ML | "
+                    f"PairedMR:${paired_alloc:.2f} MR:${mr_alloc:.2f} Final:${final_alloc:.2f} | "
+                    f"Preferred:{ticker_preferred.upper()}"
+                )
+
+            t = threading.Thread(
+                target=_run_sub_ticker,
+                kwargs=dict(
+                    label=label,
+                    ticker_label=ticker_label,
+                    ticker=ticker,
+                    market=market,
+                    strategies=strategies,
+                    private_key=ticker_pk,
+                    espn_clock=espn_clock,
+                    log_dir=log_dir,
+                    sub_results=sub_results,
+                ),
+                name=f"{label}/{ticker_label}",
+                daemon=False,
+            )
+            t.start()
+            sub_threads.append(t)
+            print_status(f"[{label}] Started sub-runner: {ticker_label}")
+
+        # --- Wait for all sub-threads ---
+        for t in sub_threads:
+            t.join()
+
+        # --- Aggregate results ---
+        results[label] = _aggregate_sub_results(sub_results)
+        print_status(f"[{label}] ✓ All {n_tickers} ticker(s) complete")
 
     except Exception as e:
         print_status(f"[{label}] ✗ ERROR: {e}")
@@ -558,7 +710,7 @@ def main() -> int:
     setup_workdir()
 
     print("\n" + "=" * 80)
-    print("  PRODUCTION WORKER RUNNER (CLOUD) — MR ONLY")
+    print("  PRODUCTION WORKER RUNNER (CLOUD) — PAIRED MR + MR + FINAL MINUTES")
     print("  Output: ./logs locally + optional R2 sync")
     print("=" * 80)
 

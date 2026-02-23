@@ -1,22 +1,17 @@
 [
-{
-    "label": "Northern Kentucky at Youngstown St.",
-    "team_name": "NKU",
-    "model_p_win": 0.51,
-    "partner_p_win":0.51,
+  {
+    "label": "Louisville at North Carolina",
+    "team_name": "LOU",
+    "model_p_win": 0.57,
+    "partner_p_win": 0.57,
     "segment": "Home Fav",
-    "espn_date": "20260222",
-    "espn_team": "NKU",
-    "espn_opponent": "YSU"
-},
-{
-    "label": "Milwaukee at Oakland",
-    "team_name": "OAK",
-    "model_p_win": 0.55,
-    "partner_p_win":0.55,
-    "segment": "Home Fav",
-    "espn_date": "20260222",
-    "espn_team": "OAK",
-    "espn_opponent": "MILW"
-}
+    "espn_date": "20260223",
+    "espn_team": "LOU",
+    "espn_opponent": "UNC",
+    "spread_tickers": [
+      "KXNCAAMBSPREAD-26FEB23LOUUNC-LOU2",
+      "KXNCAAMBSPREAD-26FEB23LOUUNC-LOU5",
+      "KXNCAAMBSPREAD-26FEB23LOUUNC-UNC1"
+    ]
+  }
 ]

@@ -1,12 +1,13 @@
 # production_strategies.py
-# Updated Feb 6, 2026 — fixes from Feb 5 post-mortem
+# Updated Feb 23, 2026 — strategy refactoring
 #
-# Changes from last night:
-#   P1: Model Edge circuit breakers (divergence, final-min lockout, re-entry cooldown, market-decided)
-#   P2: Mean Reversion adaptive threshold (dynamic σ, vol warmup, dead market detection)
-#   P3: Market quality pre-filter (skip illiquid/dead markets)
-#   P4: Settlement-aware P&L reporting
-#   P5: Fee management (fee-aware edge, lock attempt cap)
+# Strategies:
+#   - MeanReversionStrategy: refined with mean-shift exit, multi-TF trend, tiered trailing stop
+#   - PairedMeanReversionStrategy: outcome-independent (buy YES + NO when cheap)
+#   - FinalMinutesStrategy: late-game trades when ESPN WP > 90%
+#   - ExposureTracker: shared capital guard across strategies
+#
+# Removed: ModelEdge, SpreadCapture, PregameAnchored (all unprofitable)
 
 import os
 import sys
@@ -53,22 +54,6 @@ def calc_taker_fee(price_cents: int, qty: int = 1) -> float:
     fee_per = min(0.07 * p * (1 - p), 0.02)
     return fee_per * qty * 100
 
-
-def fee_aware_min_edge(price_cents: int, stop_loss_cents: int = 15,
-                       lock_prob: float = 0.55) -> float:
-    """
-    P5: Minimum edge needed to be +EV after round-trip fees.
-    Conservative lock_prob=0.55 (last night was ~64% win but still lost money).
-    """
-    entry_fee = calc_taker_fee(price_cents, 1)
-    exit_fee = calc_taker_fee(price_cents, 1)  # approximate
-    total_fees = entry_fee + exit_fee
-
-    # EV = P(lock) × (lock_profit - fees) - P(stop) × (stop + fees)
-    # For breakeven: lock_profit_needed = P(stop)/P(lock) × (stop + fees) + fees
-    p_stop = 1.0 - lock_prob
-    needed = (p_stop / lock_prob) * (stop_loss_cents + total_fees) + total_fees
-    return needed
 
 
 # =============================================================================
@@ -154,6 +139,41 @@ class MarketQualityMonitor:
             return True  # benefit of doubt during warmup
         recent = list(self.midpoints)[-lookback:]
         return (max(recent) - min(recent)) >= min_move
+
+
+# =============================================================================
+# EXPOSURE TRACKER — shared capital guard across strategies within one game
+# =============================================================================
+
+class ExposureTracker:
+    """
+    Thread-safe shared capital tracker.
+    Multiple strategies call try_reserve() before sizing entries;
+    the tracker ensures total exposure across all strategies stays
+    within max_exposure_dollars for the game.
+    """
+
+    def __init__(self, max_exposure_dollars: float):
+        self.max_exposure = max_exposure_dollars
+        self._used = 0.0
+        self._lock = threading.Lock()
+
+    def try_reserve(self, amount: float) -> bool:
+        with self._lock:
+            if self._used + amount <= self.max_exposure:
+                self._used += amount
+                return True
+            return False
+
+    def release(self, amount: float):
+        with self._lock:
+            self._used -= amount
+            self._used = max(0.0, self._used)
+
+    @property
+    def remaining(self) -> float:
+        with self._lock:
+            return max(0.0, self.max_exposure - self._used)
 
 
 # =============================================================================
@@ -400,173 +420,7 @@ class BaseStrategy(ABC):
 
 
 # =============================================================================
-# STRATEGY 1: MODEL EDGE (with P1 circuit breakers + P5 fee awareness)
-# =============================================================================
-
-class ModelEdgeStrategy(BaseStrategy):
-    """
-    Enter when market differs from model fair price.
-    
-    Feb 6 fixes:
-      - P1a: Divergence filter (block when |market - model| > divergence_cap)
-      - P1b: Final 5min lockout (inherited from BaseStrategy)
-      - P1c: Re-entry cooldown after stop (inherited, 120s)
-      - P1d: Market decided filter (skip if market >88¢ or <12¢)
-      - P5:  Fee-aware minimum edge
-    """
-
-    def __init__(self, max_capital: float, model_fair_cents: int):
-        params = {
-            "min_entry_edge": 10,
-            "min_lock_profit": 10,
-            "stop_loss": 18,
-            "take_profit": 12,
-            "max_positions": 2,
-            "min_entry_gap_secs": 45,
-            "side_cooldown_secs": 120,       # P1c
-            "stop_trading_before_close_secs": 300,  # P1b
-            "divergence_cap_cents": 20,      # P1a
-            "market_decided_hi": 88,         # P1d
-            "market_decided_lo": 12,         # P1d
-            "max_lock_attempts": 2,          # P5
-        }
-        super().__init__("model_edge", max_capital, params)
-        self.model_fair = model_fair_cents
-        self.price_history: deque = deque(maxlen=60)
-
-    def _get_dynamic_fair(
-        self,
-        current_mid: float,
-        secs_to_close: int,
-        espn_live_win_pct: Optional[float],
-        game_progress: Optional[float],
-    ) -> float:
-        """
-        New behavior:
-        - If ESPN win% is available: blend pregame model -> ESPN with aggressive decay (3.5)
-        - Else: fallback to legacy blend pregame model -> market midpoint (decay 2.0)
-        """
-        self.price_history.append(current_mid)
-
-        total_game = 2400
-        elapsed = max(0, total_game - secs_to_close)
-        progress = min(1.0, elapsed / total_game)
-
-        # Prefer ESPN-supplied progress if available
-        if isinstance(game_progress, (int, float)):
-            progress = float(max(0.0, min(1.0, game_progress)))
-
-        # ESPN blend path
-        if isinstance(espn_live_win_pct, (int, float)):
-            espn_pct = float(espn_live_win_pct)
-            # allow 0..1 input; if 0..100 mistakenly arrives, normalize
-            if espn_pct > 1.0:
-                espn_pct /= 100.0
-            espn_cents = espn_pct * 100.0
-
-            model_weight = math.exp(-3.5 * progress)
-            return model_weight * float(self.model_fair) + (1 - model_weight) * espn_cents
-
-        # Fallback: market blend
-        model_weight = math.exp(-2.0 * progress)
-        market_mid = sum(self.price_history) / len(self.price_history)
-        return model_weight * float(self.model_fair) + (1 - model_weight) * market_mid
-
-    def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
-        yes_bid = prices.get("best_yes_bid")
-        yes_ask = prices.get("imp_yes_ask")
-        no_ask = prices.get("imp_no_ask")
-
-        if not all([yes_bid, yes_ask]):
-            return False, "", 0, 0, "no_prices"
-
-        mid = (yes_bid + yes_ask) / 2
-
-        # --- P1d: Market decided filter ---
-        hi = self.params["market_decided_hi"]
-        lo = self.params["market_decided_lo"]
-        if mid > hi or mid < lo:
-            return False, "", 0, 0, f"market_decided:{mid:.0f}c"
-
-        espn_wp = context.get("espn_live_win_pct")
-        game_progress = context.get("game_progress")
-        fair = self._get_dynamic_fair(mid, secs_to_close, espn_wp, game_progress)
-
-
-        # --- P1a: Divergence filter ---
-        divergence = abs(mid - fair)
-
-        cap = self.params["divergence_cap_cents"]
-        if divergence > cap:
-            return False, "", 0, 0, f"divergence:{divergence:.0f}c>{cap}c"
-
-        # --- P5: Fee-aware minimum edge ---
-        base_min_edge = self.params["min_entry_edge"]
-        fee_min_edge = fee_aware_min_edge(
-            int(mid), stop_loss_cents=self.params["stop_loss"]
-        )
-        effective_min_edge = max(base_min_edge, int(math.ceil(fee_min_edge)))
-
-        # Check YES side
-        yes_edge = fair - yes_ask
-        # P1c: side cooldown
-        yes_cooled, _ = self._side_on_cooldown("yes")
-
-        if yes_edge >= effective_min_edge and not yes_cooled:
-            return True, "yes", int(yes_ask), 1, \
-                f"edge:{yes_edge:.1f}c,fair:{fair:.1f}c,minE:{effective_min_edge}"
-
-        # Check NO side
-        if no_ask:
-            no_fair = 100 - fair
-            no_edge = no_fair - no_ask
-            no_cooled, _ = self._side_on_cooldown("no")
-
-            if no_edge >= effective_min_edge and not no_cooled:
-                return True, "no", int(no_ask), 1, \
-                    f"edge:{no_edge:.1f}c,fair:{fair:.1f}c,minE:{effective_min_edge}"
-
-        return False, "", 0, 0, "no_edge"
-
-    def evaluate_exit(self, position, prices, secs_to_close, context) -> Tuple[bool, str, int, str]:
-        yes_bid = prices.get("best_yes_bid")
-        no_bid = prices.get("best_no_bid")
-        no_ask = prices.get("imp_no_ask")
-        yes_ask = prices.get("imp_yes_ask")
-
-        if position.side == "yes":
-            # Try to lock (P5: respect max lock attempts)
-            if no_ask and position.lock_attempts < self.params["max_lock_attempts"]:
-                profit = 100 - position.entry_price - no_ask
-                if profit >= self.params["min_lock_profit"]:
-                    position.lock_attempts += 1
-                    return True, "lock", int(no_ask), f"lock:{profit:.0f}c"
-
-            if yes_bid:
-                pnl = yes_bid - position.entry_price
-                # if pnl <= -self.params["stop_loss"]:
-                #     return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
-                if pnl >= self.params["take_profit"]:
-                    return True, "take_profit", int(yes_bid) - 1, f"tp:{pnl:.0f}c"
-        else:
-            if yes_ask and position.lock_attempts < self.params["max_lock_attempts"]:
-                profit = 100 - position.entry_price - yes_ask
-                if profit >= self.params["min_lock_profit"]:
-                    position.lock_attempts += 1
-                    return True, "lock", int(yes_ask), f"lock:{profit:.0f}c"
-
-            if no_bid:
-                pnl = no_bid - position.entry_price
-                # if pnl <= -self.params["stop_loss"]:
-                #     return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
-                if pnl >= self.params["take_profit"]:
-                    return True, "take_profit", int(no_bid) - 1, f"tp:{pnl:.0f}c"
-
-        return False, "", 0, "hold"
-
-
-# =============================================================================
-# STRATEGY 2: MEAN REVERSION (P2 adaptive threshold + dead market detection)
+# STRATEGY: MEAN REVERSION (P2 adaptive threshold + dead market detection)
 # =============================================================================
 
 class MeanReversionStrategy(BaseStrategy):
@@ -578,9 +432,14 @@ class MeanReversionStrategy(BaseStrategy):
           * within last N secs, ONLY enter preferred side
           * within last N secs, flatten any wrong-side open inventory
       - size-aware entries: qty scales to remaining allocated capital
+      - 2a: dynamic PnL floor (mean-shift exit when thesis collapses)
+      - 2b: multi-timeframe trend validation
+      - 2c: tiered trailing stop (tighter at higher peaks)
+      - 2d: shared exposure tracker integration
     """
 
-    def __init__(self, max_capital: float, preferred_side: Optional[str] = None):
+    def __init__(self, max_capital: float, preferred_side: Optional[str] = None,
+                 exposure_tracker: Optional["ExposureTracker"] = None):
         params = {
             "lookback": 60,
             "high_vol_std_mult": 1.5,
@@ -611,27 +470,37 @@ class MeanReversionStrategy(BaseStrategy):
             "force_exit_wrong_side": True,
 
             # --- SIZING ---
-            # Each entry uses a fraction of remaining capital, scaled by signal strength.
-            # At 1.5σ (minimum trigger in high-vol) → base_frac of remaining capital.
-            # At 3σ+ → up to max_frac. Linear interpolation between.
-            "size_base_frac": 0.35,       # fraction of remaining capital at minimum σ trigger
-            "size_max_frac": 0.80,        # fraction at 3σ+
-            "size_sigma_floor": 1.5,      # σ level that maps to base_frac
-            "size_sigma_cap": 3.0,        # σ level that maps to max_frac
-            "size_min_qty": 3,            # never go below this (keeps every trade meaningful)
-            "max_order_qty": 200,         # hard cap per single order
+            "size_base_frac": 0.35,
+            "size_max_frac": 0.80,
+            "size_sigma_floor": 1.5,
+            "size_sigma_cap": 3.0,
+            "size_min_qty": 3,
+            "max_order_qty": 200,
 
-            # NEW: PROFIT DEFENSE (giveback cap)
-            # Once a position reaches +Xc per contract, protect it:
-            # exit if current pnl falls below (peak * (1 - giveback_frac)).
-            "profit_defense_activate_cents": 10.0,   # activate once peak >= this
-            "profit_defense_giveback_frac": 0.50,    # allow 50% giveback from peak
-            "profit_defense_min_keep_cents": 1.0,    # don’t exit for tiny noise; require pnl <= this threshold too
+            # PROFIT DEFENSE (giveback cap) — tiered (2c)
+            "profit_defense_activate_cents": 10.0,
+            "profit_defense_giveback_frac": 0.50,       # 50% giveback for 10-15c peaks
+            "profit_defense_high_threshold": 15.0,       # above this → tighter giveback
+            "profit_defense_giveback_frac_high": 0.30,   # 30% giveback for >15c peaks
+            "profit_defense_min_keep_cents": 1.0,
 
+            # 2a: mean-shift exit (broken thesis)
+            "mean_shift_exit_cents": 3.0,
+
+            # 2b: multi-timeframe trend filter
+            "long_lookback": 250,
+            "trend_tolerance_cents": 4.0,
         }
         super().__init__("mean_reversion", max_capital, params)
 
         self.prices: deque = deque(maxlen=params["lookback"])
+        self.prices_long: deque = deque(maxlen=params["long_lookback"])  # 2b
+
+        # 2a: track rolling mean at time of each position’s entry
+        self._entry_means: Dict[str, float] = {}  # position_id -> mean at entry
+
+        # 2d: shared exposure tracker
+        self.exposure_tracker = exposure_tracker
 
         if preferred_side is not None:
             preferred_side = preferred_side.lower().strip()
@@ -643,6 +512,16 @@ class MeanReversionStrategy(BaseStrategy):
         if len(self.prices) < 5:
             return 50.0, 10.0
         prices = list(self.prices)
+        mean = sum(prices) / len(prices)
+        var = sum((p - mean) ** 2 for p in prices) / len(prices)
+        std = math.sqrt(var) if var > 0 else 5.0
+        return mean, std
+
+    def _calc_long_stats(self) -> Tuple[float, float]:
+        """2b: Stats over the longer lookback window."""
+        if len(self.prices_long) < 20:
+            return 50.0, 10.0
+        prices = list(self.prices_long)
         mean = sum(prices) / len(prices)
         var = sum((p - mean) ** 2 for p in prices) / len(prices)
         std = math.sqrt(var) if var > 0 else 5.0
@@ -733,6 +612,7 @@ class MeanReversionStrategy(BaseStrategy):
 
         mid = (yes_bid + yes_ask) / 2
         self.prices.append(mid)
+        self.prices_long.append(mid)  # 2b: feed long window
 
         warmup_ok, warmup_reason = self._check_warmup()
         if not warmup_ok:
@@ -742,14 +622,20 @@ class MeanReversionStrategy(BaseStrategy):
             return False, "", 0, 0, "dead_market"
 
         mean, std = self._calc_stats()
+        long_mean, _ = self._calc_long_stats()  # 2b
 
         std_mult = self.params["low_vol_std_mult"] if std < self.params["low_vol_cutoff"] else self.params["high_vol_std_mult"]
         threshold = std_mult * std
 
         in_dir = self._in_directional_window(int(secs_to_close))
+        trend_tol = float(self.params.get("trend_tolerance_cents", 4.0))
 
         # Price dropped → buy YES
         if mid < mean - threshold:
+            # 2b: reject if short mean is above long mean by >trend_tol (fighting downtrend)
+            if len(self.prices_long) >= 20 and (mean - long_mean) > trend_tol:
+                return False, "", 0, 0, f"trend_block_yes:short={mean:.1f}>long={long_mean:.1f}+{trend_tol}"
+
             if in_dir and self.preferred_side != "yes":
                 return False, "", 0, 0, f"dir_block:want_yes_pref_{self.preferred_side}"
             cooled, _ = self._side_on_cooldown("yes")
@@ -759,10 +645,21 @@ class MeanReversionStrategy(BaseStrategy):
             qty = self._size_qty("yes", int(yes_ask), sigma_mult=edge / std)
             if qty <= 0:
                 return False, "", 0, 0, "no_capital"
+
+            # 2d: check shared exposure
+            if self.exposure_tracker:
+                cost = int(yes_ask) * qty / 100.0
+                if not self.exposure_tracker.try_reserve(cost):
+                    return False, "", 0, 0, "exposure_limit"
+
             return True, "yes", int(yes_ask), qty, f"below:{edge:.0f}c({edge/std:.1f}σ),mult={std_mult},qty={qty}"
 
         # Price spiked → buy NO
         if mid > mean + threshold and no_ask is not None:
+            # 2b: reject if short mean is below long mean by >trend_tol (fighting uptrend)
+            if len(self.prices_long) >= 20 and (long_mean - mean) > trend_tol:
+                return False, "", 0, 0, f"trend_block_no:short={mean:.1f}<long={long_mean:.1f}-{trend_tol}"
+
             if in_dir and self.preferred_side != "no":
                 return False, "", 0, 0, f"dir_block:want_no_pref_{self.preferred_side}"
             cooled, _ = self._side_on_cooldown("no")
@@ -772,9 +669,53 @@ class MeanReversionStrategy(BaseStrategy):
             qty = self._size_qty("no", int(no_ask), sigma_mult=edge / std)
             if qty <= 0:
                 return False, "", 0, 0, "no_capital"
+
+            # 2d: check shared exposure
+            if self.exposure_tracker:
+                cost = int(no_ask) * qty / 100.0
+                if not self.exposure_tracker.try_reserve(cost):
+                    return False, "", 0, 0, "exposure_limit"
+
             return True, "no", int(no_ask), qty, f"above:{edge:.0f}c({edge/std:.1f}σ),mult={std_mult},qty={qty}"
 
         return False, "", 0, 0, "in_range"
+
+    def record_entry(self, side: str, price: float, qty: int, reason: str) -> Position:
+        """Override to track entry mean for 2a mean-shift exit."""
+        pos = super().record_entry(side, price, qty, reason)
+        mean, _ = self._calc_stats()
+        self._entry_means[pos.id] = mean
+        return pos
+
+    def _get_giveback_frac(self, peak: float) -> float:
+        """2c: Tiered trailing stop — tighter giveback at higher peaks."""
+        high_thresh = float(self.params.get("profit_defense_high_threshold", 15.0))
+        if peak >= high_thresh:
+            return float(self.params.get("profit_defense_giveback_frac_high", 0.30))
+        return float(self.params.get("profit_defense_giveback_frac", 0.50))
+
+    def _check_mean_shift_exit(self, position: Position) -> Tuple[bool, str]:
+        """2a: Exit if the rolling mean has shifted toward entry price (thesis collapsed)."""
+        entry_mean = self._entry_means.get(position.id)
+        if entry_mean is None:
+            return False, ""
+        current_mean, _ = self._calc_stats()
+        shift_limit = float(self.params.get("mean_shift_exit_cents", 3.0))
+
+        if position.side == "yes":
+            # We bought YES because mean was high and price dipped.
+            # If mean has dropped >=3c toward our entry, thesis is broken.
+            shift = entry_mean - current_mean
+            if shift >= shift_limit:
+                return True, f"mean_shift:entry_mean={entry_mean:.1f}→{current_mean:.1f} shift={shift:.1f}c"
+        else:
+            # We bought NO because mean was low and price spiked.
+            # If mean has risen >=3c toward our entry, thesis is broken.
+            shift = current_mean - entry_mean
+            if shift >= shift_limit:
+                return True, f"mean_shift:entry_mean={entry_mean:.1f}→{current_mean:.1f} shift={shift:.1f}c"
+
+        return False, ""
 
     def evaluate_exit(self, position, prices, secs_to_close, context) -> Tuple[bool, str, int, str]:
         yes_bid = prices.get("best_yes_bid")
@@ -784,7 +725,7 @@ class MeanReversionStrategy(BaseStrategy):
         if yes_bid is None:
             return False, "", 0, "no_bid"
 
-        # NEW: late-game flatten wrong-side inventory
+        # Late-game flatten wrong-side inventory
         if (
             self._in_directional_window(int(secs_to_close))
             and bool(self.params.get("force_exit_wrong_side", True))
@@ -799,31 +740,32 @@ class MeanReversionStrategy(BaseStrategy):
         mid = (yes_bid + (yes_ask or yes_bid)) / 2
         mean, std = self._calc_stats()
 
-        # Existing: reversion exit (stop loss OFF) — now PATIENT via pnl floor gate
         pnl_floor = float(self.params.get("reversion_exit_pnl_floor", -3))
 
         if position.side == "yes":
             pnl = float(yes_bid) - float(position.entry_price)
 
-            # --- NEW: Profit-defense giveback exit ---
-            # Track peak favorable pnl (per-contract)
+            # Track peak favorable pnl
             if pnl > position.max_fav_pnl_cents:
                 position.max_fav_pnl_cents = pnl
                 position.max_fav_ts = utc_now().isoformat()
 
+            # 2c: Tiered profit-defense giveback exit
             activate = float(self.params.get("profit_defense_activate_cents", 10.0))
-            giveback_frac = float(self.params.get("profit_defense_giveback_frac", 0.50))
+            giveback_frac = self._get_giveback_frac(position.max_fav_pnl_cents)
             min_keep = float(self.params.get("profit_defense_min_keep_cents", 1.0))
 
             if position.max_fav_pnl_cents >= activate:
                 floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
-                # only trigger if we're meaningfully giving back (and not just tiny wiggle)
                 if pnl <= max(min_keep, floor):
                     return True, "take_profit", max(1, int(yes_bid) - 1), \
-                        f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c"
+                        f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c gb={giveback_frac:.0%}"
 
+            # 2a: mean-shift exit (broken thesis)
+            ms_exit, ms_reason = self._check_mean_shift_exit(position)
+            if ms_exit and pnl > pnl_floor:
+                return True, "take_profit", max(1, int(yes_bid) - 1), ms_reason
 
-            # If we're still very underwater, do NOT "revert exit" just because mean drifted.
             if pnl < pnl_floor:
                 return False, "", 0, f"hold_pnl_floor:{pnl:.0f}c<{pnl_floor:.0f}c"
 
@@ -834,21 +776,25 @@ class MeanReversionStrategy(BaseStrategy):
             if no_bid is not None:
                 pnl = float(no_bid) - float(position.entry_price)
 
-                    # --- NEW: Profit-defense giveback exit ---
                 if pnl > position.max_fav_pnl_cents:
                     position.max_fav_pnl_cents = pnl
                     position.max_fav_ts = utc_now().isoformat()
 
+                # 2c: Tiered profit-defense giveback exit
                 activate = float(self.params.get("profit_defense_activate_cents", 10.0))
-                giveback_frac = float(self.params.get("profit_defense_giveback_frac", 0.50))
+                giveback_frac = self._get_giveback_frac(position.max_fav_pnl_cents)
                 min_keep = float(self.params.get("profit_defense_min_keep_cents", 1.0))
 
                 if position.max_fav_pnl_cents >= activate:
                     floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
                     if pnl <= max(min_keep, floor):
                         return True, "take_profit", max(1, int(no_bid) - 1), \
-                            f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c"
+                            f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c gb={giveback_frac:.0%}"
 
+                # 2a: mean-shift exit (broken thesis)
+                ms_exit, ms_reason = self._check_mean_shift_exit(position)
+                if ms_exit and pnl > pnl_floor:
+                    return True, "take_profit", max(1, int(no_bid) - 1), ms_reason
 
                 if pnl < pnl_floor:
                     return False, "", 0, f"hold_pnl_floor:{pnl:.0f}c<{pnl_floor:.0f}c"
@@ -859,263 +805,536 @@ class MeanReversionStrategy(BaseStrategy):
         return False, "", 0, "hold"
 
 # =============================================================================
-# STRATEGY 3: PREGAME ANCHORED + LIVE MANAGEMENT (partner test)
+# STRATEGY: PAIRED MEAN REVERSION (outcome-independent)
 # =============================================================================
 
-class PregameAnchoredStrategy(BaseStrategy):
+class PairedMeanReversionStrategy(BaseStrategy):
     """
-    Partner test strategy:
-      - Place ONE pregame limit entry within the last ~5 minutes before tip,
-        improving the market ask by a cushion (5-6c).
-      - If filled, manage live with:
-          1) lock ASAP when profitable,
-          2) take profit at +10-15c,
-          3) exit with 10 minutes remaining if still open,
-          4) cut at -15 to -20c.
+    Outcome-independent strategy: buy YES when cheap AND buy NO when cheap.
+    If avg_yes_cost + avg_no_cost < 100c, guaranteed profit regardless of winner.
 
-    Fair (pregame) is a blend of:
-      - market midpoint (default 70%)
-      - two models (default 30%), internally split between our model and partner.
+    Uses the same MR signal infrastructure (sigma thresholds, warmup, dead market).
+    Paired positions are held to settlement. Unpaired excess uses standard MR exits.
     """
 
-    def __init__(
-        self,
-        max_capital: float,
-        model_fair_cents: int,
-        partner_fair_cents: int,
-        cushion_cents: int = 6,
-        market_weight: float = 0.70,
-        model_share: float = 0.50,
-    ):
+    def __init__(self, max_capital: float, preferred_side: Optional[str] = None,
+                 exposure_tracker: Optional["ExposureTracker"] = None):
         params = {
-            "min_entry_edge": 8,              # pregame: require a real mismatch
-            "min_lock_profit": 10,
-            "stop_loss": 18,
-            "take_profit": 15,
-            "exit_with_secs_remaining": 600,  # 10 minutes
-            "max_positions": 1,
-            "min_entry_gap_secs": 60,     # we handle re-tries ourselves
-            "side_cooldown_secs": 0,
-            "stop_trading_before_close_secs": 0,  # allow entry pregame even though "close" is far
-            "max_lock_attempts": 2,
+            "lookback": 60,
+            "high_vol_std_mult": 1.5,
+            "low_vol_std_mult": 2.5,
+            "low_vol_cutoff": 5.0,
+
+            "max_positions": 8,  # 4 YES + 4 NO max
+            "max_yes_positions": 4,
+            "max_no_positions": 4,
+
+            "min_entry_gap_secs": 8,
+            "side_cooldown_secs": 20,
+            "stop_trading_before_close_secs": 0,
+
+            # warmup / dead-market
+            "warmup_samples": 60,
+            "warmup_min_range": 5.0,
+            "dead_lookback": 30,
+            "dead_min_move": 3.0,
+
+            # sizing (same as MR)
+            "size_base_frac": 0.35,
+            "size_max_frac": 0.80,
+            "size_sigma_floor": 1.5,
+            "size_sigma_cap": 3.0,
+            "size_min_qty": 3,
+            "max_order_qty": 200,
+
+            # pairing params
+            "pair_target_profit_cents": 8,  # target 8c+ guaranteed profit per pair
+            "pair_eagerness_boost": 0.3,     # reduce σ threshold by this for the missing side
+
+            # exit params for unpaired excess
+            "reversion_exit_pnl_floor": -3,
+            "directional_close_secs": 300,
+            "force_exit_wrong_side": True,
+
+            # profit defense for unpaired
+            "profit_defense_activate_cents": 10.0,
+            "profit_defense_giveback_frac": 0.50,
+            "profit_defense_high_threshold": 15.0,
+            "profit_defense_giveback_frac_high": 0.30,
+            "profit_defense_min_keep_cents": 1.0,
+
+            # long trend filter
+            "long_lookback": 250,
+            "trend_tolerance_cents": 4.0,
         }
-        super().__init__("pregame_anchored", max_capital, params)
-        self.model_fair = int(model_fair_cents)
-        self.partner_fair = int(partner_fair_cents)
-        self.cushion_cents = int(cushion_cents)
-        self.market_weight = float(market_weight)
-        self.model_share = float(model_share)
+        super().__init__("paired_mr", max_capital, params)
 
-        # State: only attempt ONE pregame order; if it doesn't fill, we skip the game.
-        # NEW: keep retrying pregame until ESPN goes live (rate-limited by min_entry_gap_secs)
-        self._last_pregame_try_ts: Optional[float] = None
+        self.prices: deque = deque(maxlen=params["lookback"])
+        self.prices_long: deque = deque(maxlen=params["long_lookback"])
 
+        self.exposure_tracker = exposure_tracker
 
-    # --- BaseStrategy hooks ---
+        if preferred_side is not None:
+            preferred_side = preferred_side.lower().strip()
+            if preferred_side not in ("yes", "no"):
+                preferred_side = None
+        self.preferred_side = preferred_side
 
-    def entry_wait_secs(self, context: Dict[str, Any]) -> int:
-        # Rest as maker briefly, then cancel/timeout so we can reprice later
-        return int(os.getenv("PREGAME_REST_SECS") or "15")
+        # Track cumulative YES/NO fills for pairing math
+        self._yes_qty = 0
+        self._yes_cost_sum = 0.0  # sum of (entry_price * qty) for YES
+        self._no_qty = 0
+        self._no_cost_sum = 0.0
 
-    def on_entry_result(self, filled: bool, context: Dict[str, Any]) -> None:
-        # If no fill, we just try again later (rate-limited)
-        return
+    # --- Stats helpers (same as MR) ---
 
-    # --- Internal helpers ---
+    def _calc_stats(self) -> Tuple[float, float]:
+        if len(self.prices) < 5:
+            return 50.0, 10.0
+        prices = list(self.prices)
+        mean = sum(prices) / len(prices)
+        var = sum((p - mean) ** 2 for p in prices) / len(prices)
+        std = math.sqrt(var) if var > 0 else 5.0
+        return mean, std
 
-    def _pregame_fair_yes(self, market_mid: float) -> float:
-        models_weight = 1.0 - self.market_weight
-        model_mix = self.model_share * float(self.model_fair) + (1.0 - self.model_share) * float(self.partner_fair)
-        return self.market_weight * float(market_mid) + models_weight * model_mix
+    def _calc_long_stats(self) -> Tuple[float, float]:
+        if len(self.prices_long) < 20:
+            return 50.0, 10.0
+        prices = list(self.prices_long)
+        mean = sum(prices) / len(prices)
+        var = sum((p - mean) ** 2 for p in prices) / len(prices)
+        std = math.sqrt(var) if var > 0 else 5.0
+        return mean, std
 
-    def _improved_limit(self, bid: Optional[int], ask: Optional[int]) -> Optional[int]:
-        if ask is None:
-            return None
-        # target = ask - cushion, but ensure we improve the bid by at least 1 tick if bid exists
-        target = int(round(ask - self.cushion_cents))
-        if bid is not None:
-            target = max(target, int(bid) + 1)
-        target = min(target, int(ask) - 1)
-        if target < 1 or target > 99:
-            return None
-        return target
+    def _check_warmup(self) -> Tuple[bool, str]:
+        n = len(self.prices)
+        if n < self.params["warmup_samples"]:
+            return False, f"warmup:{n}/{self.params['warmup_samples']}"
+        recent = list(self.prices)
+        price_range = max(recent) - min(recent)
+        if price_range < self.params["warmup_min_range"]:
+            return False, f"warmup_range:{price_range:.1f}c<{self.params['warmup_min_range']}c"
+        return True, "ok"
 
-    # --- Strategy interface ---
+    def _is_dead_market(self) -> bool:
+        lookback = self.params["dead_lookback"]
+        if len(self.prices) < lookback:
+            return False
+        recent = list(self.prices)[-lookback:]
+        return (max(recent) - min(recent)) < self.params["dead_min_move"]
+
+    def _collateral_per_contract(self, side: str, price_cents: int) -> float:
+        return price_cents / 100.0
+
+    def _size_qty(self, side: str, price_cents: int, sigma_mult: float = 1.5) -> int:
+        remaining = max(0.0, float(self.max_capital) - float(self.capital_used))
+        per = self._collateral_per_contract(side, price_cents)
+        if per <= 0:
+            return 0
+        max_possible = int(remaining / per)
+
+        sigma_floor = float(self.params.get("size_sigma_floor", 1.5))
+        sigma_cap = float(self.params.get("size_sigma_cap", 3.0))
+        base_frac = float(self.params.get("size_base_frac", 0.35))
+        max_frac = float(self.params.get("size_max_frac", 0.80))
+
+        t = max(0.0, min(1.0, (sigma_mult - sigma_floor) / max(0.01, sigma_cap - sigma_floor)))
+        frac = base_frac + t * (max_frac - base_frac)
+
+        qty = int(max_possible * frac)
+        min_qty = int(self.params.get("size_min_qty", 3))
+        max_qty = int(self.params.get("max_order_qty", 200))
+
+        qty = max(min(min_qty, max_possible), qty)
+        qty = min(qty, max_qty)
+        qty = min(qty, max_possible)
+        return max(0, qty)
+
+    # --- Pairing math ---
+
+    @property
+    def _avg_yes_cost(self) -> float:
+        return (self._yes_cost_sum / self._yes_qty) if self._yes_qty > 0 else 0.0
+
+    @property
+    def _avg_no_cost(self) -> float:
+        return (self._no_cost_sum / self._no_qty) if self._no_qty > 0 else 0.0
+
+    @property
+    def _paired_qty(self) -> int:
+        return min(self._yes_qty, self._no_qty)
+
+    @property
+    def _guaranteed_profit_per_pair(self) -> float:
+        if self._paired_qty == 0:
+            return 0.0
+        return 100.0 - self._avg_yes_cost - self._avg_no_cost
+
+    def _count_side_positions(self, side: str) -> int:
+        return sum(1 for p in self.positions if p.side == side)
+
+    def _side_qty(self, side: str) -> int:
+        return sum(p.qty for p in self.positions if p.side == side)
+
+    def record_entry(self, side: str, price: float, qty: int, reason: str) -> Position:
+        pos = super().record_entry(side, price, qty, reason)
+        if side == "yes":
+            self._yes_qty += qty
+            self._yes_cost_sum += price * qty
+        else:
+            self._no_qty += qty
+            self._no_cost_sum += price * qty
+        return pos
+
+    # --- Entry ---
+
+    def _in_directional_window(self, secs_to_close: int) -> bool:
+        directional_secs = int(self.params.get("directional_close_secs", 300))
+        return (
+            self.preferred_side in ("yes", "no")
+            and secs_to_close <= directional_secs
+        )
+
     def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
-        if self.positions:
-            return False, "", 0, 0, "already_in"
-
-        # Only run pregame anchor if ESPN is NOT live yet
-        if bool(context.get("espn_is_live")):
-            return False, "", 0, 0, "espn_live_now"
-
-        # Rate-limit our retries
-        now = time.time()
-        gap = int(self.params.get("min_entry_gap_secs", 60))
-        if self._last_pregame_try_ts is not None and (now - self._last_pregame_try_ts) < gap:
-            return False, "", 0, 0, f"pregame_throttle:{int(now - self._last_pregame_try_ts)}s/{gap}s"
-
         yes_bid = prices.get("best_yes_bid")
         yes_ask = prices.get("imp_yes_ask")
-        no_bid = prices.get("best_no_bid")
         no_ask = prices.get("imp_no_ask")
 
         if yes_bid is None or yes_ask is None:
             return False, "", 0, 0, "no_prices"
 
-        market_mid = (yes_bid + yes_ask) / 2.0
-        fair_yes = self._pregame_fair_yes(market_mid)
+        mid = (yes_bid + yes_ask) / 2
+        self.prices.append(mid)
+        self.prices_long.append(mid)
 
-        # Edge to buy YES at ask
-        yes_edge = fair_yes - float(yes_ask)
+        warmup_ok, warmup_reason = self._check_warmup()
+        if not warmup_ok:
+            return False, "", 0, 0, warmup_reason
 
-        # Edge to buy NO at ask (fair_no = 100 - fair_yes)
-        no_edge = (100.0 - fair_yes) - float(no_ask) if no_ask is not None else -9999.0
+        if self._is_dead_market():
+            return False, "", 0, 0, "dead_market"
 
-        min_edge = float(self.params.get("min_entry_edge", 8))
+        mean, std = self._calc_stats()
+        long_mean, _ = self._calc_long_stats()
 
-        # Choose the better side if it clears min edge
-        choose_side = None
-        if yes_edge >= min_edge and yes_edge >= no_edge:
-            choose_side = "yes"
-        elif no_ask is not None and no_edge >= min_edge:
-            choose_side = "no"
+        std_mult = self.params["low_vol_std_mult"] if std < self.params["low_vol_cutoff"] else self.params["high_vol_std_mult"]
+        threshold = std_mult * std
 
-        if choose_side is None:
-            return False, "", 0, 0, f"no_edge:yes={yes_edge:.1f}c no={no_edge:.1f}c min={min_edge}"
+        # Eagerness boost: reduce threshold for the missing side
+        boost = float(self.params.get("pair_eagerness_boost", 0.3))
+        yes_has = self._yes_qty > 0
+        no_has = self._no_qty > 0
 
-        if choose_side == "yes":
-            limit_px = self._improved_limit(yes_bid, yes_ask)
-            if limit_px is None:
-                return False, "", 0, 0, "bad_limit_yes"
-            self._last_pregame_try_ts = now
-            return True, "yes", int(limit_px), 1, f"pregame_yes:fair={fair_yes:.1f} ask={yes_ask} edge={yes_edge:.1f}c"
-        else:
-            # For NO: we “buy NO” at a price in the NO book → use no_bid/no_ask
-            limit_px = self._improved_limit(no_bid, no_ask)
-            if limit_px is None:
-                return False, "", 0, 0, "bad_limit_no"
-            self._last_pregame_try_ts = now
-            return True, "no", int(limit_px), 1, f"pregame_no:fair_no={100-fair_yes:.1f} ask={no_ask} edge={no_edge:.1f}c"
+        yes_threshold = threshold - (boost * std if no_has and not yes_has else 0)
+        no_threshold = threshold - (boost * std if yes_has and not no_has else 0)
+
+        trend_tol = float(self.params.get("trend_tolerance_cents", 4.0))
+        target_profit = float(self.params.get("pair_target_profit_cents", 8))
+        max_yes_pos = int(self.params.get("max_yes_positions", 4))
+        max_no_pos = int(self.params.get("max_no_positions", 4))
+
+        in_dir = self._in_directional_window(int(secs_to_close))
+
+        # Price dropped → buy YES (cheap YES)
+        if mid < mean - yes_threshold and self._count_side_positions("yes") < max_yes_pos:
+            # Check pairing feasibility: would buying YES at ask still allow profit?
+            hypothetical_yes_cost = float(yes_ask)
+            if no_has:
+                combined = hypothetical_yes_cost + self._avg_no_cost
+                if combined > (100 - target_profit):
+                    return False, "", 0, 0, f"pair_too_expensive:yes={hypothetical_yes_cost:.0f}+no_avg={self._avg_no_cost:.0f}={combined:.0f}c"
+
+            # Trend filter
+            if len(self.prices_long) >= 20 and (mean - long_mean) > trend_tol:
+                return False, "", 0, 0, f"trend_block_yes:short={mean:.1f}>long={long_mean:.1f}+{trend_tol}"
+
+            if in_dir and self.preferred_side != "yes":
+                return False, "", 0, 0, f"dir_block:want_yes_pref_{self.preferred_side}"
+
+            cooled, _ = self._side_on_cooldown("yes")
+            if cooled:
+                return False, "", 0, 0, "cooldown_yes"
+
+            edge = mean - mid
+            qty = self._size_qty("yes", int(yes_ask), sigma_mult=edge / std)
+            if qty <= 0:
+                return False, "", 0, 0, "no_capital"
+
+            if self.exposure_tracker:
+                cost = int(yes_ask) * qty / 100.0
+                if not self.exposure_tracker.try_reserve(cost):
+                    return False, "", 0, 0, "exposure_limit"
+
+            paired_info = f"Y:{self._yes_qty}+{qty}/N:{self._no_qty}"
+            return True, "yes", int(yes_ask), qty, \
+                f"pair_yes:{edge:.0f}c({edge/std:.1f}σ) {paired_info} guar={self._guaranteed_profit_per_pair:.1f}c"
+
+        # Price spiked → buy NO (cheap NO)
+        if mid > mean + no_threshold and no_ask is not None and self._count_side_positions("no") < max_no_pos:
+            hypothetical_no_cost = float(no_ask)
+            if yes_has:
+                combined = self._avg_yes_cost + hypothetical_no_cost
+                if combined > (100 - target_profit):
+                    return False, "", 0, 0, f"pair_too_expensive:yes_avg={self._avg_yes_cost:.0f}+no={hypothetical_no_cost:.0f}={combined:.0f}c"
+
+            if len(self.prices_long) >= 20 and (long_mean - mean) > trend_tol:
+                return False, "", 0, 0, f"trend_block_no:short={mean:.1f}<long={long_mean:.1f}-{trend_tol}"
+
+            if in_dir and self.preferred_side != "no":
+                return False, "", 0, 0, f"dir_block:want_no_pref_{self.preferred_side}"
+
+            cooled, _ = self._side_on_cooldown("no")
+            if cooled:
+                return False, "", 0, 0, "cooldown_no"
+
+            edge = mid - mean
+            qty = self._size_qty("no", int(no_ask), sigma_mult=edge / std)
+            if qty <= 0:
+                return False, "", 0, 0, "no_capital"
+
+            if self.exposure_tracker:
+                cost = int(no_ask) * qty / 100.0
+                if not self.exposure_tracker.try_reserve(cost):
+                    return False, "", 0, 0, "exposure_limit"
+
+            paired_info = f"Y:{self._yes_qty}/N:{self._no_qty}+{qty}"
+            return True, "no", int(no_ask), qty, \
+                f"pair_no:{edge:.0f}c({edge/std:.1f}σ) {paired_info} guar={self._guaranteed_profit_per_pair:.1f}c"
+
+        return False, "", 0, 0, "in_range"
+
+    # --- Exit ---
 
     def evaluate_exit(self, position, prices, secs_to_close, context) -> Tuple[bool, str, int, str]:
+        """
+        Paired positions: hold to settlement (guaranteed profit).
+        Unpaired excess: use standard MR exit logic.
+        """
         yes_bid = prices.get("best_yes_bid")
         no_bid = prices.get("best_no_bid")
-        no_ask = prices.get("imp_no_ask")
         yes_ask = prices.get("imp_yes_ask")
 
-        # 3) time-based exit with 10 minutes remaining
-        exit_with = int(self.params.get("exit_with_secs_remaining", 600))
-        if secs_to_close <= exit_with:
-            if position.side == "yes" and yes_bid is not None:
-                return True, "timeout", int(yes_bid) - 1, f"time_exit:{int(secs_to_close)}s"
-            if position.side == "no" and no_bid is not None:
-                return True, "timeout", int(no_bid) - 1, f"time_exit:{int(secs_to_close)}s"
+        if yes_bid is None:
+            return False, "", 0, "no_bid"
 
-        # 1) lock ASAP if profitable
+        paired = self._paired_qty
+
+        # Determine if this position is part of a paired set
+        # Paired positions = min(yes_qty, no_qty) on each side → hold to settlement
+        yes_positions = sorted([p for p in self.positions if p.side == "yes"], key=lambda p: p.entry_time)
+        no_positions = sorted([p for p in self.positions if p.side == "no"], key=lambda p: p.entry_time)
+
+        # Count how many contracts are paired on each side
+        paired_yes_remaining = paired
+        is_paired = False
         if position.side == "yes":
-            if no_ask is not None and position.lock_attempts < self.params["max_lock_attempts"]:
-                profit = 100 - position.entry_price - no_ask
-                if profit >= self.params["min_lock_profit"]:
-                    position.lock_attempts += 1
-                    return True, "lock", int(no_ask), f"lock:{profit:.0f}c"
+            for p in yes_positions:
+                if paired_yes_remaining <= 0:
+                    break
+                if p.id == position.id:
+                    is_paired = True
+                    break
+                paired_yes_remaining -= p.qty
+        else:
+            paired_no_remaining = paired
+            for p in no_positions:
+                if paired_no_remaining <= 0:
+                    break
+                if p.id == position.id:
+                    is_paired = True
+                    break
+                paired_no_remaining -= p.qty
 
-            # 2/4) take profit / stop
-            if yes_bid is not None:
-                pnl = yes_bid - position.entry_price
-                if pnl >= self.params["take_profit"]:
-                    return True, "take_profit", int(yes_bid) - 1, f"tp:{pnl:.0f}c"
-                # if pnl <= -self.params["stop_loss"]:
-                #     return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
+        # Paired → hold to settlement
+        if is_paired:
+            return False, "", 0, f"paired:hold_to_settle guar={self._guaranteed_profit_per_pair:.1f}c"
+
+        # Unpaired excess → standard MR exit logic
+        # Late-game flatten
+        if (
+            self._in_directional_window(int(secs_to_close))
+            and bool(self.params.get("force_exit_wrong_side", True))
+            and self.preferred_side in ("yes", "no")
+            and position.side != self.preferred_side
+        ):
+            if position.side == "yes" and yes_bid is not None:
+                return True, "timeout", max(1, int(yes_bid) - 1), f"unpaired_dir_flatten:{int(secs_to_close)}s"
+            if position.side == "no" and no_bid is not None:
+                return True, "timeout", max(1, int(no_bid) - 1), f"unpaired_dir_flatten:{int(secs_to_close)}s"
+
+        mid = (yes_bid + (yes_ask or yes_bid)) / 2
+        mean, std = self._calc_stats()
+        pnl_floor = float(self.params.get("reversion_exit_pnl_floor", -3))
+
+        if position.side == "yes":
+            pnl = float(yes_bid) - float(position.entry_price)
+
+            if pnl > position.max_fav_pnl_cents:
+                position.max_fav_pnl_cents = pnl
+                position.max_fav_ts = utc_now().isoformat()
+
+            activate = float(self.params.get("profit_defense_activate_cents", 10.0))
+            high_thresh = float(self.params.get("profit_defense_high_threshold", 15.0))
+            giveback_frac = float(self.params.get("profit_defense_giveback_frac_high", 0.30)) \
+                if position.max_fav_pnl_cents >= high_thresh \
+                else float(self.params.get("profit_defense_giveback_frac", 0.50))
+            min_keep = float(self.params.get("profit_defense_min_keep_cents", 1.0))
+
+            if position.max_fav_pnl_cents >= activate:
+                floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
+                if pnl <= max(min_keep, floor):
+                    return True, "take_profit", max(1, int(yes_bid) - 1), \
+                        f"unpaired_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c"
+
+            if pnl < pnl_floor:
+                return False, "", 0, f"hold_pnl_floor:{pnl:.0f}c"
+
+            if mid >= mean - 2:
+                return True, "take_profit", max(1, int(yes_bid) - 1), f"unpaired_reverted:{pnl:.0f}c"
 
         else:
-            if yes_ask is not None and position.lock_attempts < self.params["max_lock_attempts"]:
-                profit = 100 - position.entry_price - yes_ask
-                if profit >= self.params["min_lock_profit"]:
-                    position.lock_attempts += 1
-                    return True, "lock", int(yes_ask), f"lock:{profit:.0f}c"
-
             if no_bid is not None:
-                pnl = no_bid - position.entry_price
-                if pnl >= self.params["take_profit"]:
-                    return True, "take_profit", int(no_bid) - 1, f"tp:{pnl:.0f}c"
-                # if pnl <= -self.params["stop_loss"]:
-                #     return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
+                pnl = float(no_bid) - float(position.entry_price)
 
-        return False, "", 0, "hold"
+                if pnl > position.max_fav_pnl_cents:
+                    position.max_fav_pnl_cents = pnl
+                    position.max_fav_ts = utc_now().isoformat()
 
+                activate = float(self.params.get("profit_defense_activate_cents", 10.0))
+                high_thresh = float(self.params.get("profit_defense_high_threshold", 15.0))
+                giveback_frac = float(self.params.get("profit_defense_giveback_frac_high", 0.30)) \
+                    if position.max_fav_pnl_cents >= high_thresh \
+                    else float(self.params.get("profit_defense_giveback_frac", 0.50))
+                min_keep = float(self.params.get("profit_defense_min_keep_cents", 1.0))
+
+                if position.max_fav_pnl_cents >= activate:
+                    floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
+                    if pnl <= max(min_keep, floor):
+                        return True, "take_profit", max(1, int(no_bid) - 1), \
+                            f"unpaired_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c"
+
+                if pnl < pnl_floor:
+                    return False, "", 0, f"hold_pnl_floor:{pnl:.0f}c"
+
+                if mid <= mean + 2:
+                    return True, "take_profit", max(1, int(no_bid) - 1), f"unpaired_reverted:{pnl:.0f}c"
+
+        return False, "", 0, "unpaired_hold"
 
 
 # =============================================================================
-# STRATEGY 3: SPREAD CAPTURE
+# STRATEGY: FINAL MINUTES (near-guaranteed late-game trades)
 # =============================================================================
 
-class SpreadCaptureStrategy(BaseStrategy):
-    """Profit from wide spreads. Largely unchanged — wasn't the problem."""
+class FinalMinutesStrategy(BaseStrategy):
+    """
+    Only trades in the last 5 minutes when ESPN win probability is decisive (>90% or <10%).
+    Buys the winning side below fair value, exploiting thin books / slow price updates.
+    Holds to settlement (no exit unless WP dramatically reverses).
+    """
+
+    bypass_market_quality = True  # late-game markets often look "dead" at 95/5
 
     def __init__(self, max_capital: float):
         params = {
-            "min_spread": 6,
-            "improve_cents": 1,
-            "min_lock_profit": 8,
-            "stop_loss": 12,
-            "max_positions": 2,
-            "min_entry_gap_secs": 60,
-            "side_cooldown_secs": 90,
-            "stop_trading_before_close_secs": 300,
-            "max_lock_attempts": 2,
+            "max_positions": 4,
+            "min_entry_gap_secs": 15,
+            "side_cooldown_secs": 0,
+            "stop_trading_before_close_secs": 0,
+
+            # activation
+            "active_window_secs": 300,     # last 5 minutes
+            "min_wp_threshold": 0.90,      # ESPN WP must be > this (or < 1-this)
+            "discount_cents": 10,          # buy at fair - this many cents
+
+            # exit
+            "wp_reversal_threshold": 0.70, # exit if WP reverses below this
+
+            # sizing
+            "entry_frac": 0.80,           # 80% of remaining allocation per entry
+            "min_qty": 5,
         }
-        super().__init__("spread_capture", max_capital, params)
+        super().__init__("final_minutes", max_capital, params)
 
     def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
-        yes_bid = prices.get("best_yes_bid")
+        # Only active in last N minutes
+        window = int(self.params.get("active_window_secs", 300))
+        if secs_to_close > window:
+            return False, "", 0, 0, f"too_early:{int(secs_to_close)}s>{window}s"
+
+        espn_wp = context.get("espn_live_win_pct")
+        if espn_wp is None:
+            return False, "", 0, 0, "no_espn_wp"
+
+        espn_wp = float(espn_wp)
+        if espn_wp > 1.0:
+            espn_wp /= 100.0
+
+        wp_thresh = float(self.params.get("min_wp_threshold", 0.90))
+        discount = float(self.params.get("discount_cents", 10))
+
         yes_ask = prices.get("imp_yes_ask")
-        no_bid = prices.get("best_no_bid")
+        no_ask = prices.get("imp_no_ask")
 
-        if not all([yes_bid, yes_ask, no_bid]):
-            return False, "", 0, 0, "no_prices"
+        # High WP → buy YES below fair
+        if espn_wp >= wp_thresh and yes_ask is not None:
+            fair_yes = espn_wp * 100.0
+            if float(yes_ask) <= fair_yes - discount:
+                qty = self._calc_qty(int(yes_ask))
+                if qty <= 0:
+                    return False, "", 0, 0, "no_capital"
+                return True, "yes", int(yes_ask), qty, \
+                    f"final_yes:wp={espn_wp:.2f} fair={fair_yes:.0f} ask={yes_ask} disc={fair_yes - float(yes_ask):.0f}c"
 
-        spread = yes_ask - yes_bid
-        if spread < self.params["min_spread"]:
-            return False, "", 0, 0, f"spread:{spread}c"
+        # Low WP → buy NO below fair
+        if espn_wp <= (1.0 - wp_thresh) and no_ask is not None:
+            fair_no = (1.0 - espn_wp) * 100.0
+            if float(no_ask) <= fair_no - discount:
+                qty = self._calc_qty(int(no_ask))
+                if qty <= 0:
+                    return False, "", 0, 0, "no_capital"
+                return True, "no", int(no_ask), qty, \
+                    f"final_no:wp={espn_wp:.2f} fair_no={fair_no:.0f} ask={no_ask} disc={fair_no - float(no_ask):.0f}c"
 
-        our_bid = yes_bid + self.params["improve_cents"]
-        potential_lock_cost = our_bid + (100 - no_bid)
-        potential_profit = 100 - potential_lock_cost
+        return False, "", 0, 0, f"no_signal:wp={espn_wp:.2f}"
 
-        if potential_profit >= self.params["min_lock_profit"]:
-            return True, "yes", our_bid, 1, f"spread:{spread}c,pot:{potential_profit:.0f}c"
-
-        return False, "", 0, 0, "no_opp"
+    def _calc_qty(self, price_cents: int) -> int:
+        remaining = max(0.0, float(self.max_capital) - float(self.capital_used))
+        per = price_cents / 100.0
+        if per <= 0:
+            return 0
+        max_possible = int(remaining / per)
+        frac = float(self.params.get("entry_frac", 0.80))
+        qty = max(int(max_possible * frac), int(self.params.get("min_qty", 5)))
+        qty = min(qty, max_possible)
+        return max(0, qty)
 
     def evaluate_exit(self, position, prices, secs_to_close, context) -> Tuple[bool, str, int, str]:
+        """Hold to settlement unless WP dramatically reverses."""
+        espn_wp = context.get("espn_live_win_pct")
+        if espn_wp is None:
+            return False, "", 0, "hold_no_wp"
+
+        espn_wp = float(espn_wp)
+        if espn_wp > 1.0:
+            espn_wp /= 100.0
+
+        reversal = float(self.params.get("wp_reversal_threshold", 0.70))
+
         yes_bid = prices.get("best_yes_bid")
-        no_ask = prices.get("imp_no_ask")
-        yes_ask = prices.get("imp_yes_ask")
         no_bid = prices.get("best_no_bid")
 
-        if position.side == "yes":
-            if no_ask and position.lock_attempts < self.params["max_lock_attempts"]:
-                profit = 100 - position.entry_price - no_ask
-                if profit >= self.params["min_lock_profit"]:
-                    position.lock_attempts += 1
-                    return True, "lock", int(no_ask), f"lock:{profit:.0f}c"
-            if yes_bid:
-                pnl = yes_bid - position.entry_price
-                # if pnl <= -self.params["stop_loss"]:
-                #     return True, "stop", int(yes_bid) - 1, f"stop:{pnl:.0f}c"
-        else:
-            if yes_ask and position.lock_attempts < self.params["max_lock_attempts"]:
-                profit = 100 - position.entry_price - yes_ask
-                if profit >= self.params["min_lock_profit"]:
-                    position.lock_attempts += 1
-                    return True, "lock", int(yes_ask), f"lock:{profit:.0f}c"
-            if no_bid:
-                pnl = no_bid - position.entry_price
-                # if pnl <= -self.params["stop_loss"]:
-                #     return True, "stop", int(no_bid) - 1, f"stop:{pnl:.0f}c"
+        # If we hold YES but WP dropped below reversal threshold
+        if position.side == "yes" and espn_wp < reversal and yes_bid is not None:
+            return True, "stop", max(1, int(yes_bid) - 1), \
+                f"wp_reversal:wp={espn_wp:.2f}<{reversal}"
 
-        return False, "", 0, "waiting"
+        # If we hold NO but WP rose above (1 - reversal) threshold
+        if position.side == "no" and espn_wp > (1.0 - reversal) and no_bid is not None:
+            return True, "stop", max(1, int(no_bid) - 1), \
+                f"wp_reversal:wp={espn_wp:.2f}>{1.0 - reversal:.2f}"
+
+        return False, "", 0, "hold_to_settle"
 
 
 # =============================================================================
@@ -1555,8 +1774,8 @@ class GameRunner:
                     if should_exit:
                         self._execute_exit(strategy, pos, exit_type, exit_price, reason)
 
-                # --- Entries (only in tradeable markets) ---
-                if not mq_ok:
+                # --- Entries (only in tradeable markets, unless strategy bypasses) ---
+                if not mq_ok and not getattr(strategy, 'bypass_market_quality', False):
                     continue  # P3: skip entries in dead/illiquid markets
 
                 can_enter, _ = strategy.can_enter(secs_to_close=int(secs_to_close))
