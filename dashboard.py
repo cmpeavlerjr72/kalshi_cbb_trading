@@ -945,6 +945,64 @@ def build_dashboard_data(date_str: str):
 
 
 # =============================================================================
+# BACKGROUND DATA POLLER
+# =============================================================================
+
+_bg_data = {}       # date_str -> full dashboard payload
+_bg_data_lock = threading.Lock()
+_bg_active_date = None  # date the poller is currently refreshing
+
+
+def _bg_poller():
+    """Background thread: continuously rebuilds dashboard data every 15s."""
+    while True:
+        date_str = _bg_active_date
+        if date_str:
+            try:
+                t0 = time.time()
+                payload = build_dashboard_data(date_str)
+                elapsed = time.time() - t0
+                with _bg_data_lock:
+                    _bg_data[date_str] = payload
+                ng = len(payload.get("games", []))
+                print(f"[poller] Refreshed {date_str}: {ng} games in {elapsed:.1f}s")
+            except Exception as e:
+                print(f"[poller] Error building data for {date_str}: {e}")
+        time.sleep(15)
+
+
+def get_cached_data(date_str):
+    """Return cached dashboard data instantly, or a loading stub."""
+    global _bg_active_date
+
+    # Tell poller which date to fetch
+    if _bg_active_date != date_str:
+        _bg_active_date = date_str
+        # Clear stale cache for old date
+        with _bg_data_lock:
+            pass  # poller will populate on next cycle
+
+    with _bg_data_lock:
+        cached = _bg_data.get(date_str)
+
+    if cached:
+        return cached
+
+    # Nothing cached yet — try a quick synchronous build (first load)
+    # This runs once; after that the poller keeps it fresh
+    try:
+        payload = build_dashboard_data(date_str)
+        with _bg_data_lock:
+            _bg_data[date_str] = payload
+        return payload
+    except Exception as e:
+        print(f"[dashboard] Initial build error: {e}")
+        return {"date": date_str, "games": [], "fetch_time": datetime.now(timezone.utc).isoformat(),
+                "portfolio": {"total_pnl": 0, "realized": 0, "unrealized": 0, "open_count": 0, "wins": 0, "losses": 0, "win_rate": 0},
+                "ml_vs_spread": {"ml_realized": 0, "ml_unrealized": 0, "ml_total": 0, "spread_realized": 0, "spread_unrealized": 0, "spread_total": 0}}
+
+
+# =============================================================================
 # HTTP HANDLER
 # =============================================================================
 
@@ -988,7 +1046,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not date_str:
                     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                     date_str = today
-                data = build_dashboard_data(date_str)
+                data = get_cached_data(date_str)
                 self._send_json(data)
 
             else:
@@ -1011,6 +1069,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.getenv("PORT", os.getenv("DASHBOARD_PORT", "8050")))
+
+    # Start background data poller
+    poller = threading.Thread(target=_bg_poller, daemon=True)
+    poller.start()
+    print("[dashboard] Background poller started")
+
     server = HTTPServer(("0.0.0.0", port), DashboardHandler)
     print(f"Dashboard running on port {port}")
     print("Press Ctrl+C to stop")
