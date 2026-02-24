@@ -26,6 +26,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Kalshi API for position reconciliation
+try:
+    from combo_vnext import _load_private_key
+    from fetch_kalshi_ledger import fetch_positions as kalshi_fetch_positions
+    _kalshi_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip()
+    _kalshi_private_key = _load_private_key(_kalshi_key_path) if _kalshi_key_path else None
+    if _kalshi_private_key:
+        print("[dashboard] Kalshi API key loaded for reconciliation")
+    else:
+        print("[dashboard] No KALSHI_PRIVATE_KEY_PATH — reconciliation disabled")
+except Exception as _e:
+    _kalshi_private_key = None
+    print(f"[dashboard] Kalshi key load failed (reconciliation disabled): {_e}")
+
 # =============================================================================
 # ESPN LOOKUP (from games.json)
 # =============================================================================
@@ -913,8 +927,9 @@ def build_dashboard_data(date_str: str):
 
             # Open positions from trades
             open_pos = compute_open_positions(trades)
-            # Tag each with ticker
+            # Tag each with display ticker, preserve raw Kalshi ticker for reconciliation
             for p in open_pos:
+                p["raw_ticker"] = p.get("ticker", "")
                 p["ticker"] = ticker_label
             open_pos = mark_to_market(open_pos, latest_snap)
 
@@ -1035,6 +1050,68 @@ def build_dashboard_data(date_str: str):
     mvs = result["ml_vs_spread"]
     mvs["ml_total"] = mvs["ml_realized"] + mvs["ml_unrealized"]
     mvs["spread_total"] = mvs["spread_realized"] + mvs["spread_unrealized"]
+
+    # --- Position reconciliation against Kalshi API ---
+    result["reconciliation"] = []
+    result["has_mismatch"] = False
+    if _kalshi_private_key:
+        try:
+            kalshi_positions = kalshi_fetch_positions(_kalshi_private_key)
+
+            # Build Kalshi position map: {ticker -> {yes: qty, no: qty}}
+            kalshi_map = {}
+            for kp in kalshi_positions:
+                kt = kp.get("ticker", "")
+                ks = kp.get("side", "")
+                kq = int(kp.get("count", 0))
+                if kq <= 0:
+                    continue
+                if kt not in kalshi_map:
+                    kalshi_map[kt] = {"yes": 0, "no": 0}
+                if ks in ("yes", "no"):
+                    kalshi_map[kt][ks] += kq
+
+            # Build bot position map from all open positions across all games
+            bot_map = {}
+            for game_data in result["games"]:
+                for pos in game_data.get("open_positions", []):
+                    rt = pos.get("raw_ticker", "")
+                    if not rt:
+                        continue
+                    ps = pos.get("side", "")
+                    pq = pos.get("qty", 0)
+                    if pq <= 0:
+                        continue
+                    if rt not in bot_map:
+                        bot_map[rt] = {"yes": 0, "no": 0}
+                    if ps in ("yes", "no"):
+                        bot_map[rt][ps] += pq
+
+            # Compare: union of all tickers from both sources
+            all_tickers = set(kalshi_map.keys()) | set(bot_map.keys())
+            for ticker in sorted(all_tickers):
+                kalshi_qty = kalshi_map.get(ticker, {"yes": 0, "no": 0})
+                bot_qty = bot_map.get(ticker, {"yes": 0, "no": 0})
+                # Short display label from ticker
+                display = ticker.rsplit("-", 1)[-1] if "-" in ticker else ticker
+                for side in ("yes", "no"):
+                    kq = kalshi_qty[side]
+                    bq = bot_qty[side]
+                    if kq == 0 and bq == 0:
+                        continue
+                    status = "OK" if kq == bq else "MISMATCH"
+                    if status == "MISMATCH":
+                        result["has_mismatch"] = True
+                    result["reconciliation"].append({
+                        "ticker": display,
+                        "raw_ticker": ticker,
+                        "side": side,
+                        "bot_qty": bq,
+                        "kalshi_qty": kq,
+                        "status": status,
+                    })
+        except Exception as e:
+            print(f"[dashboard] Reconciliation error: {e}")
 
     return result
 
@@ -1259,6 +1336,16 @@ svg text { font-family:inherit; }
 .legend { display:flex; gap:14px; margin-bottom:4px; flex-wrap:wrap; }
 .legend-item { font-size:11px; display:flex; align-items:center; gap:4px; }
 .legend-dot { width:10px; height:10px; border-radius:2px; display:inline-block; }
+.recon-banner { background:#3a1a1a; border:2px solid var(--red); border-radius:6px; padding:10px 14px; margin-bottom:10px; display:none; }
+.recon-banner.visible { display:block; }
+.recon-banner h3 { color:var(--red); margin-bottom:6px; font-size:14px; }
+.recon-banner table { width:100%; border-collapse:collapse; font-size:12px; }
+.recon-banner th { text-align:left; color:var(--text2); padding:3px 8px; border-bottom:1px solid var(--border); }
+.recon-banner td { padding:3px 8px; border-bottom:1px solid var(--bg3); }
+.recon-banner .mismatch { color:var(--red); font-weight:bold; }
+.recon-banner .ok { color:var(--green); }
+.recon-ok-banner { background:#1a3a1a; border:1px solid var(--green); border-radius:6px; padding:6px 14px; margin-bottom:10px; display:none; font-size:12px; color:var(--green); }
+.recon-ok-banner.visible { display:block; }
 </style>
 </head>
 <body>
@@ -1307,6 +1394,15 @@ svg text { font-family:inherit; }
     <div class="legend" id="priceLegend"></div>
     <div id="priceChart"></div>
   </div>
+</div>
+
+<div class="recon-ok-banner" id="reconOk">Positions reconciled — all OK</div>
+<div class="recon-banner" id="reconBanner">
+  <h3>POSITION MISMATCH — Kalshi vs Bot</h3>
+  <table>
+    <thead><tr><th>Ticker</th><th>Side</th><th>Bot Qty</th><th>Kalshi Qty</th><th>Status</th></tr></thead>
+    <tbody id="reconBody"></tbody>
+  </table>
 </div>
 
 <div id="gamesContainer"></div>
@@ -1652,6 +1748,35 @@ function renderCharts(data) {
   priceEl.innerHTML = buildSVG(priceSeries, {width:chartW, height:180, markers:priceMarkers});
 }
 
+function renderReconciliation(data) {
+  const banner = document.getElementById('reconBanner');
+  const okBanner = document.getElementById('reconOk');
+  const body = document.getElementById('reconBody');
+  const recon = data.reconciliation || [];
+
+  if (!recon.length) {
+    banner.className = 'recon-banner';
+    okBanner.className = 'recon-ok-banner';
+    return;
+  }
+
+  body.innerHTML = '';
+  recon.forEach(r => {
+    const cls = r.status === 'MISMATCH' ? 'mismatch' : 'ok';
+    body.innerHTML += '<tr><td>' + r.ticker + '</td><td>' + r.side.toUpperCase() +
+      '</td><td>' + r.bot_qty + '</td><td>' + r.kalshi_qty +
+      '</td><td class="' + cls + '">' + r.status + '</td></tr>';
+  });
+
+  if (data.has_mismatch) {
+    banner.className = 'recon-banner visible';
+    okBanner.className = 'recon-ok-banner';
+  } else {
+    banner.className = 'recon-banner';
+    okBanner.className = 'recon-ok-banner visible';
+  }
+}
+
 function renderGames(data) {
   const container = document.getElementById('gamesContainer');
   container.innerHTML = '';
@@ -1856,6 +1981,7 @@ async function fetchData() {
     renderMlVsSpread(data.ml_vs_spread || {});
     renderCharts(data);
     renderGames(data);
+    renderReconciliation(data);
 
     // Hide ML vs Spread row when no CBB games visible
     const hasCbb = (data.games||[]).some(g => (g.sport||'cbb') === 'cbb');

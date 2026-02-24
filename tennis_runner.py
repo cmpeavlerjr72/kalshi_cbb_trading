@@ -57,53 +57,38 @@ import re
 # CONFIGURATION
 # ============================================================================
 
-TENNIS_SERIES = "KXATPMATCH"
+TENNIS_SERIES = ["KXATPMATCH", "KXATPCHALLENGERMATCH"]
 
 # Today's matches — edit before running
 # player_code must match the Kalshi ticker suffix (e.g. "POP", "RUB", "MEN")
 MATCHES = [
     {
-        "label": "Rublev vs Royer",
-        "player_code": "RUB",          # the player whose ML ticker we trade
-        "opponent_code": "ROY",
-        "model_p_win": 0.50,            # set to 0.50 = no directional bias (pure MR)
-    },
-    {
-        "label": "Popyrin vs Majchrzak",
-        "player_code": "POP",
-        "opponent_code": "MAJ",
+        "label": "Tabilo vs Barrios Vera",
+        "player_code": "TAB",
+        "opponent_code": "BAR",
+        "match_key": "26FEB22TABBAR",
         "model_p_win": 0.50,
     },
     {
-        "label": "Mensik vs Hurkacz",
-        "player_code": "MEN",
-        "opponent_code": "HUR",
+        "label": "Cerundolo vs Garin",
+        "player_code": "CER",
+        "opponent_code": "GAR",
+        "match_key": "26FEB22CERGAR",
         "model_p_win": 0.50,
     },
     {
-        "label": "Navone vs Kopriva",
-        "player_code": "NAV",
-        "opponent_code": "KOP",
-        "match_key": "26FEB22NAVKOP",   # disambiguate from Nava (also NAV)
+        "label": "Passaro vs Vallejo",
+        "player_code": "PAS",
+        "opponent_code": "VAL",
+        "match_key": "26FEB24PASVAL",
         "model_p_win": 0.50,
     },
     {
-        "label": "Moller vs Burruchaga",
-        "player_code": "MOL",
-        "opponent_code": "BUR",
-        "model_p_win": 0.50,
-    },
-    {
-        "label": "Nava vs Berrettini",
-        "player_code": "BER",           # use BER to avoid NAV collision
-        "opponent_code": "NAV",
-        "match_key": "26FEB22NAVBER",
-        "model_p_win": 0.50,
-    },
-    {
-        "label": "Vallejo vs Passaro",
-        "player_code": "VAL",
-        "opponent_code": "PAS",
+        "label": "La Serna vs Aboian",
+        "player_code": "LA",
+        "opponent_code": "ABO",
+        "match_key": "26FEB24LAABO",
+        "series": "KXATPCHALLENGERMATCH",
         "model_p_win": 0.50,
     },
 ]
@@ -136,14 +121,18 @@ def build_match_log_dir(match_label: str, match_date: str) -> Path:
 # MARKET DISCOVERY
 # ============================================================================
 
-def find_ml_ticker_for_player(private_key, player_code: str, match_key: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+def find_ml_ticker_for_player(private_key, player_code: str, match_key: Optional[str] = None,
+                              series_override: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
     """
     Find the ML (match winner) market for a player by ticker suffix match.
-    Searches the KXATPMATCH series for an active market ending in -<PLAYER_CODE>.
+    Searches all TENNIS_SERIES for an active market ending in -<PLAYER_CODE>.
     If match_key is provided, filters candidates whose ticker contains the match_key
     substring (e.g. "26FEB22NAVKOP") to disambiguate players with the same code.
     """
-    markets = get_markets_in_series(private_key, TENNIS_SERIES)
+    series_list = [series_override] if series_override else TENNIS_SERIES
+    markets = []
+    for s in series_list:
+        markets.extend(get_markets_in_series(private_key, s))
     code = player_code.upper()
     suffix = f"-{code}"
 
@@ -221,13 +210,14 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
 
         player_code = match_config["player_code"]
         match_key = match_config.get("match_key")
+        series_override = match_config.get("series")
 
         # Discover ML ticker
-        if bundle:
+        if bundle and not series_override:
             ml_ticker, match_info, _ = find_ml_ticker_from_bundle(bundle, player_code, match_key)
             ml_market = fetch_market(private_key, ml_ticker)
         else:
-            ml_ticker, ml_market = find_ml_ticker_for_player(private_key, player_code, match_key)
+            ml_ticker, ml_market = find_ml_ticker_for_player(private_key, player_code, match_key, series_override)
 
         print_status(f"[{label}] ML Market: {ml_ticker} — {ml_market.get('title', 'N/A')}")
         print_status(f"[{label}] Close time: {ml_market.get('close_time', 'N/A')}")
@@ -312,6 +302,12 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
             maker_entries=True,
             maker_exits=True,
             min_entry_price=20,
+            mq_params={
+                "std_min": 1.5,      # tennis has flat holds between points
+                "spread_max": 10.0,  # tennis books are naturally thinner
+                "range_min": 3.0,    # smaller range still valid
+            },
+            base_strategy_overrides={"mean_reversion": TENNIS_MR_OVERRIDES},
         )
 
         summary = runner.run()

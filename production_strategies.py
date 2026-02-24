@@ -43,6 +43,7 @@ from combo_vnext import (
     SERIES_TICKER,
     MIN_LIQUIDITY_CONTRACTS,
 )
+from fetch_kalshi_ledger import fetch_positions
 
 # =============================================================================
 # FEE CALCULATIONS (P5)
@@ -68,9 +69,13 @@ class MarketQualityMonitor:
     Allows strategies to skip dead/illiquid markets.
     """
 
-    def __init__(self, warmup_samples: int = 40, warmup_secs: int = 180):
+    def __init__(self, warmup_samples: int = 40, warmup_secs: int = 180,
+                 std_min: float = 3.0, range_min: float = 5.0, spread_max: float = 6.0):
         self.warmup_samples = warmup_samples
         self.warmup_secs = warmup_secs
+        self.std_min = std_min
+        self.range_min = range_min
+        self.spread_max = spread_max
         self.midpoints: deque = deque(maxlen=200)
         self.spreads: deque = deque(maxlen=200)
         self.first_sample_time: Optional[float] = None
@@ -116,13 +121,13 @@ class MarketQualityMonitor:
         recent_spreads = list(self.spreads)[-30:] if len(self.spreads) >= 30 else list(self.spreads)
         avg_spread = sum(recent_spreads) / len(recent_spreads) if recent_spreads else 99
 
-        # P3 criteria: skip if std <3¢, range <5¢, or spread >6¢ consistently
-        if std < 3.0:
-            return False, f"dead_market:std={std:.1f}c"
-        if price_range < 5.0:
-            return False, f"dead_market:range={price_range:.1f}c"
-        if avg_spread > 6.0:
-            return False, f"illiquid:avg_spread={avg_spread:.1f}c"
+        # P3 criteria: skip if std/range/spread outside thresholds
+        if std < self.std_min:
+            return False, f"dead_market:std={std:.1f}c<{self.std_min}"
+        if price_range < self.range_min:
+            return False, f"dead_market:range={price_range:.1f}c<{self.range_min}"
+        if avg_spread > self.spread_max:
+            return False, f"illiquid:avg_spread={avg_spread:.1f}c>{self.spread_max}"
 
         return True, f"ok:std={std:.1f},range={price_range:.1f},spread={avg_spread:.1f}"
 
@@ -611,6 +616,11 @@ class MeanReversionStrategy(BaseStrategy):
             and secs_to_close <= directional_secs
         )
 
+    def feed_price(self, mid: float):
+        """Append mid to rolling windows (called every tick, regardless of MQ state)."""
+        self.prices.append(mid)
+        self.prices_long.append(mid)
+
     def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
         yes_bid = prices.get("best_yes_bid")
         yes_ask = prices.get("imp_yes_ask")
@@ -620,8 +630,7 @@ class MeanReversionStrategy(BaseStrategy):
             return False, "", 0, 0, "no_prices"
 
         mid = (yes_bid + yes_ask) / 2
-        self.prices.append(mid)
-        self.prices_long.append(mid)  # 2b: feed long window
+        # prices are now fed externally via feed_price()
 
         warmup_ok, warmup_reason = self._check_warmup()
         if not warmup_ok:
@@ -1000,6 +1009,11 @@ class PairedMeanReversionStrategy(BaseStrategy):
             and secs_to_close <= directional_secs
         )
 
+    def feed_price(self, mid: float):
+        """Append mid to rolling windows (called every tick, regardless of MQ state)."""
+        self.prices.append(mid)
+        self.prices_long.append(mid)
+
     def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
         yes_bid = prices.get("best_yes_bid")
         yes_ask = prices.get("imp_yes_ask")
@@ -1009,8 +1023,7 @@ class PairedMeanReversionStrategy(BaseStrategy):
             return False, "", 0, 0, "no_prices"
 
         mid = (yes_bid + yes_ask) / 2
-        self.prices.append(mid)
-        self.prices_long.append(mid)
+        # prices are now fed externally via feed_price()
 
         warmup_ok, warmup_reason = self._check_warmup()
         if not warmup_ok:
@@ -1364,6 +1377,8 @@ class GameRunner:
         maker_entries: bool = False,
         maker_exits: bool = False,
         min_entry_price: int = 0,
+        mq_params: Optional[Dict[str, float]] = None,
+        base_strategy_overrides: Optional[Dict[str, Dict]] = None,
     ):
         self.label = game_label
         self.ticker = ticker
@@ -1375,9 +1390,11 @@ class GameRunner:
         self.maker_entries = maker_entries
         self.maker_exits = maker_exits
         self.min_entry_price = min_entry_price
+        self._base_strategy_overrides = base_strategy_overrides
 
         # P3: Market quality monitor
-        self.quality = MarketQualityMonitor(warmup_samples=40, warmup_secs=180)
+        mq_kw = mq_params or {}
+        self.quality = MarketQualityMonitor(warmup_samples=40, warmup_secs=180, **mq_kw)
         self._market_killed = False
         self._market_kill_reason = ""
 
@@ -1512,6 +1529,7 @@ class GameRunner:
         print_status(f"[{self.label}][{strategy.name}] ENTRY [{mode}] {side.upper()} {qty}x @ {price}c — {reason}")
         self._log_event(strategy.name, f"entry_attempt_{mode}", f"{side} {qty}x@{price}c {reason}")
 
+        order_id = None
         try:
             ob = fetch_orderbook(self.ticker)
             px = derive_prices(ob)
@@ -1559,8 +1577,9 @@ class GameRunner:
                 return None
 
         except Exception as e:
-            print_status(f"[{self.label}][{strategy.name}] ENTRY ERROR: {e}")
-            self._log_event(strategy.name, "entry_error", str(e))
+            oid_info = f" order_id={order_id}" if order_id else ""
+            print_status(f"[{self.label}][{strategy.name}] ENTRY ERROR: {e}{oid_info}")
+            self._log_event(strategy.name, "entry_error", f"{e}{oid_info}")
             return None
 
     def _execute_exit(self, strategy: BaseStrategy, position: Position,
@@ -1571,6 +1590,7 @@ class GameRunner:
         lock_price = None
         use_maker = (self.maker_exits and exit_type not in ("timeout", "lock"))
         mode = "maker" if use_maker else "taker"
+        order_id = None
 
         try:
             if exit_type == "lock":
@@ -1671,8 +1691,9 @@ class GameRunner:
             return closed
 
         except Exception as e:
-            print_status(f"[{self.label}][{strategy.name}] EXIT ERROR: {e}")
-            self._log_event(strategy.name, "exit_error", str(e))
+            oid_info = f" order_id={order_id}" if order_id else ""
+            print_status(f"[{self.label}][{strategy.name}] EXIT ERROR: {e}{oid_info}")
+            self._log_event(strategy.name, "exit_error", f"{e}{oid_info}")
             return None
 
     # --- P4: Settlement-aware P&L ---
@@ -1820,6 +1841,10 @@ class GameRunner:
             if self.snapshots % self._config_check_interval == 0:
                 self._check_config_reload()
 
+            # Periodic position reconciliation (~5 min at 3s polling)
+            if self.snapshots % 100 == 0 and self.snapshots > 0:
+                self._reconcile_positions()
+
             # Compute midpoint and spread for quality monitor
             yes_bid = prices.get("best_yes_bid")
             yes_ask = prices.get("imp_yes_ask")
@@ -1879,6 +1904,13 @@ class GameRunner:
                 "secs_to_tip": secs_to_tip,      # int seconds or None
             }
 
+
+            # Feed prices to all strategies regardless of MQ state
+            # so warmup progresses even during MQ-blocked periods
+            if mid is not None:
+                for strategy in self.strategies:
+                    if hasattr(strategy, 'feed_price'):
+                        strategy.feed_price(mid)
 
             for strategy in self.strategies:
                 # --- Exits first (always allowed, even in dead markets) ---
@@ -1946,6 +1978,12 @@ class GameRunner:
                 is_first_load = (self._last_config_mtime == 0.0)
                 new_cfg = json.loads(self._config_path.read_text(encoding="utf-8"))
                 for strategy in self.strategies:
+                    # Re-apply sport-specific base overrides first
+                    if self._base_strategy_overrides:
+                        base = self._base_strategy_overrides.get(strategy.name, {})
+                        if base:
+                            strategy.update_params(base)
+                    # Then apply live config on top
                     overrides = new_cfg.get(strategy.name, {})
                     if overrides:
                         strategy.update_params(overrides)
@@ -2013,3 +2051,38 @@ class GameRunner:
 
         except Exception as e:
             self._log_event("system", "verify_error", str(e))
+
+    def _reconcile_positions(self):
+        """Compare in-memory positions against Kalshi API positions for this ticker."""
+        try:
+            kalshi_positions = fetch_positions(self.private_key)
+            # Filter to this ticker
+            kalshi_for_ticker = [p for p in kalshi_positions if p.get("ticker") == self.ticker]
+
+            # Sum Kalshi qty by side
+            kalshi_yes = sum(int(p.get("count", 0)) for p in kalshi_for_ticker if p.get("side") == "yes")
+            kalshi_no = sum(int(p.get("count", 0)) for p in kalshi_for_ticker if p.get("side") == "no")
+
+            # Sum in-memory strategy positions by side
+            bot_yes = 0
+            bot_no = 0
+            for s in self.strategies:
+                for pos in s.positions:
+                    if pos.side == "yes":
+                        bot_yes += pos.qty
+                    elif pos.side == "no":
+                        bot_no += pos.qty
+
+            if kalshi_yes == bot_yes and kalshi_no == bot_no:
+                self._log_event("system", "reconcile_ok",
+                               f"YES bot={bot_yes} kalshi={kalshi_yes} | NO bot={bot_no} kalshi={kalshi_no}")
+            else:
+                self._log_event("system", "reconcile_MISMATCH",
+                               f"YES bot={bot_yes} kalshi={kalshi_yes} | NO bot={bot_no} kalshi={kalshi_no}")
+                print_status(
+                    f"\033[1;31m[{self.label}] *** POSITION MISMATCH *** "
+                    f"YES bot={bot_yes} kalshi={kalshi_yes} | "
+                    f"NO bot={bot_no} kalshi={kalshi_no}\033[0m"
+                )
+        except Exception as e:
+            self._log_event("system", "reconcile_error", str(e))
