@@ -19,9 +19,38 @@ from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from datetime import datetime, timezone
 
+import requests as _requests
+
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# =============================================================================
+# ESPN LOOKUP (from games.json)
+# =============================================================================
+
+GAMES_JSON = Path(__file__).parent / "games.json"
+
+
+def _load_espn_lookup():
+    """Map game labels (underscore form) to ESPN config."""
+    try:
+        games = json.loads(GAMES_JSON.read_text())
+        lookup = {}
+        for g in games:
+            key = g["label"].replace(" ", "_")
+            lookup[key] = {
+                "espn_date": g["espn_date"],
+                "espn_team": g["espn_team"].upper(),
+                "espn_opponent": (g.get("espn_opponent") or "").upper(),
+                "team_name": g.get("team_name", ""),
+            }
+        return lookup
+    except Exception:
+        return {}
+
+
+ESPN_LOOKUP = _load_espn_lookup()
 
 # =============================================================================
 # R2 / S3 CONFIG
@@ -76,6 +105,166 @@ class R2Cache:
 
 
 _cache = R2Cache(ttl_secs=15)
+
+
+# =============================================================================
+# ESPN SCORE FETCHING
+# =============================================================================
+
+def _fetch_all_scores(espn_date):
+    """
+    Fetch ESPN scoreboard for a date, return {TEAM_ABBR: score_info}.
+    One request covers all games on that date; cached 15s via _cache.
+    """
+    cache_key = f"__espn_scores__{espn_date}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
+        resp = _requests.get(url, params={"dates": espn_date, "groups": "50", "limit": "500"},
+                             timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+        data = resp.json()
+    except Exception:
+        return {}
+
+    scores = {}
+    for ev in data.get("events", []):
+        comp = (ev.get("competitions") or [{}])[0]
+        competitors = comp.get("competitors") or []
+
+        # Extract status
+        status_obj = comp.get("status") or ev.get("status") or {}
+        typ = status_obj.get("type") or {}
+        state = (typ.get("state") or "").lower()  # pre/in/post
+        completed = bool(typ.get("completed"))
+        period = 0
+        clock_str = ""
+        try:
+            period = int(status_obj.get("period") or 0)
+        except (ValueError, TypeError):
+            pass
+        clock_str = status_obj.get("displayClock") or ""
+
+        if completed or state == "post":
+            clock_display = "Final" + (f" (OT)" if period > 2 else "")
+        elif state == "pre":
+            clock_display = "Pre-game"
+        elif state == "in":
+            if period == 1:
+                clock_display = f"1H {clock_str}"
+            elif period == 2:
+                clock_display = f"2H {clock_str}"
+            elif period > 2:
+                clock_display = f"OT{period-2} {clock_str}"
+            else:
+                clock_display = clock_str
+        else:
+            clock_display = "--"
+
+        # Build teams dict {ABBR: score}
+        teams = {}
+        for c in competitors:
+            abbr = (c.get("team", {}).get("abbreviation") or "").upper()
+            score_val = c.get("score")
+            try:
+                teams[abbr] = int(score_val) if score_val is not None else None
+            except (ValueError, TypeError):
+                teams[abbr] = None
+
+        info = {"teams": teams, "clock_display": clock_display, "state": state, "period": period}
+
+        # Index by every team abbreviation in this event
+        for abbr in teams:
+            scores[abbr] = info
+
+    _cache.put(cache_key, scores)
+    return scores
+
+
+def _get_game_score(game_key):
+    """
+    Get score info for a game. Returns dict with team_score, opp_score,
+    score_display, clock_display, or empty dict if unavailable.
+    """
+    cfg = ESPN_LOOKUP.get(game_key)
+    if not cfg:
+        return {}
+
+    all_scores = _fetch_all_scores(cfg["espn_date"])
+    if not all_scores:
+        return {}
+
+    info = all_scores.get(cfg["espn_team"])
+    if not info:
+        return {}
+
+    teams = info["teams"]
+    team_score = teams.get(cfg["espn_team"])
+    opp_score = teams.get(cfg["espn_opponent"])
+
+    if team_score is not None and opp_score is not None:
+        score_display = f"{cfg['espn_team']} {team_score} - {cfg['espn_opponent']} {opp_score}"
+    elif team_score is not None:
+        score_display = f"{cfg['espn_team']} {team_score}"
+    else:
+        score_display = ""
+
+    return {
+        "team_score": team_score,
+        "opp_score": opp_score,
+        "score_display": score_display,
+        "clock_display": info["clock_display"],
+        "game_state": info["state"],
+    }
+
+
+# =============================================================================
+# MR SIGNAL COMPUTATION
+# =============================================================================
+
+def compute_mr_signal(snapshots):
+    """
+    Compute MR proximity from snapshot mid values.
+    Matches MR strategy: lookback=60, low_vol_std_mult=2.5 (std<5), high_vol_std_mult=1.5.
+    """
+    mids = []
+    for s in snapshots:
+        v = s.get("mid")
+        if v:
+            try:
+                f = float(v)
+                mids.append(f)
+            except (ValueError, TypeError):
+                pass
+
+    if len(mids) < 10:
+        return None
+
+    window = mids[-60:]  # last 60 samples (MR lookback)
+    n = len(window)
+    mean = sum(window) / n
+    variance = sum((x - mean) ** 2 for x in window) / n
+    std = variance ** 0.5
+
+    if std < 0.1:
+        return {"mr_mean": round(mean, 2), "mr_std": 0, "mr_threshold": 0,
+                "mr_deviation": 0, "mr_pct": 0, "status": "dead"}
+
+    std_mult = 2.5 if std < 5.0 else 1.5
+    threshold = std_mult * std
+    deviation = mids[-1] - mean
+
+    pct = abs(deviation) / threshold * 100 if threshold > 0 else 0
+
+    return {
+        "mr_mean": round(mean, 2),
+        "mr_std": round(std, 2),
+        "mr_threshold": round(threshold, 2),
+        "mr_deviation": round(deviation, 2),
+        "mr_pct": round(min(pct, 999), 1),
+    }
 
 
 # =============================================================================
@@ -561,13 +750,23 @@ def build_dashboard_data(date_str: str):
     }
 
     for game_info in games:
+        game_key = game_info["game"]
         game_data = {
-            "game": game_info["game"].replace("_", " "),
+            "game": game_key.replace("_", " "),
             "tickers": [],
             "events": [],
             "game_progress": None,
             "espn_wp": None,
         }
+
+        # ESPN live scores
+        score_info = _get_game_score(game_key)
+        if score_info:
+            game_data["team_score"] = score_info.get("team_score")
+            game_data["opp_score"] = score_info.get("opp_score")
+            game_data["score_display"] = score_info.get("score_display", "")
+            game_data["clock_display"] = score_info.get("clock_display", "")
+            game_data["game_state"] = score_info.get("game_state", "")
 
         all_open_positions = []
         all_closed_stats = []
@@ -647,6 +846,9 @@ def build_dashboard_data(date_str: str):
             chart_data = build_chart_data(snapshots, positions, ticker_label)
             trade_markers = build_trade_markers(trades, positions)
 
+            # MR signal proximity
+            mr_signal = compute_mr_signal(snapshots)
+
             ticker_data = {
                 "label": ticker_label,
                 "type": ticker_type(ticker_label),
@@ -661,6 +863,7 @@ def build_dashboard_data(date_str: str):
                 "unrealized": unrealized,
                 "chart": chart_data,
                 "markers": trade_markers,
+                "mr_signal": mr_signal,
             }
             game_data["tickers"].append(ticker_data)
 
@@ -940,6 +1143,32 @@ function fmtAge(secs) {
   return Math.floor(secs/3600) + 'h ' + Math.floor((secs%3600)/60) + 'm';
 }
 
+function fmtSignal(sig) {
+  if (!sig) return '<span style="color:var(--text2)">--</span>';
+  if (sig.status === 'dead') return '<span style="color:var(--text2)">DEAD</span>';
+  const dev = sig.mr_deviation;
+  const thr = sig.mr_threshold;
+  const pct = sig.mr_pct;
+  const dir = dev > 0 ? 'HIGH' : 'LOW';
+  const absDev = Math.abs(dev).toFixed(1);
+  const dist = Math.abs(Math.abs(dev) - thr).toFixed(1);
+
+  if (pct >= 100) {
+    return '<span style="color:#f85149;font-weight:bold;">TRIGGERED (' + dir + ')</span>';
+  }
+  // Color: green < 50%, yellow 50-80%, orange 80-95%, red 95%+
+  let color = '#3fb950';
+  if (pct >= 95) color = '#f85149';
+  else if (pct >= 80) color = '#d29922';
+  else if (pct >= 50) color = '#e3b341';
+
+  // Mini bar
+  const barW = Math.min(pct, 100);
+  const bar = '<span style="display:inline-block;width:40px;height:6px;background:var(--bg3);border-radius:3px;vertical-align:middle;margin-left:4px;">'
+    + '<span style="display:block;width:'+barW+'%;height:100%;background:'+color+';border-radius:3px;"></span></span>';
+  return '<span style="color:'+color+'">'+dist+'c ('+dir+')'+bar+'</span>';
+}
+
 // ─── SVG CHART HELPER ───
 function buildSVG(series, opts) {
   // series: [{label, color, points:[{x,y}]}]
@@ -1188,13 +1417,14 @@ function renderGames(data) {
 
     const progress = game.game_progress != null ? (game.game_progress*100).toFixed(0)+'%' : '--';
     const wp = game.espn_wp != null ? (game.espn_wp > 1 ? game.espn_wp.toFixed(0) : (game.espn_wp*100).toFixed(0))+'%' : '--';
+    const scorePart = game.score_display ? '<span style="color:var(--white);font-size:14px;font-weight:bold;">'+game.score_display+'</span> <span style="color:var(--text2);font-size:12px;">'+( game.clock_display||'')+'</span> &nbsp; ' : '';
 
     let html = '<div class="game-header"><span class="title">GAME: '+game.game+'</span>';
-    html += '<span class="meta">Progress: '+progress+' &nbsp; ESPN WP: '+wp+'</span></div>';
+    html += '<span class="meta">'+scorePart+'Progress: '+progress+' &nbsp; ESPN WP: '+wp+'</span></div>';
 
     // Ticker table
     html += '<h3>Tickers</h3>';
-    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>Open</th><th>Realized</th><th>Unrealized</th><th>Total</th></tr>';
+    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>Signal</th><th>Open</th><th>Realized</th><th>Unrealized</th><th>Total</th></tr>';
     (game.tickers||[]).forEach(t => {
       const typeTag = t.type==='ML'?'tag-ml':'tag-spread';
       const tickTotal = (t.realized||0) + (t.unrealized||0);
@@ -1204,6 +1434,7 @@ function renderGames(data) {
       html += '<td>'+(t.yes_bid||'--')+'/'+(t.yes_ask||'--')+'</td>';
       html += '<td>'+(t.mid?t.mid.toFixed(1):'--')+'</td>';
       html += '<td>'+(t.spread||'--')+'</td>';
+      html += '<td>'+fmtSignal(t.mr_signal)+'</td>';
       html += '<td>'+t.open_count+'</td>';
       html += '<td class="'+pnlClass(t.realized)+'">'+fmtCents(t.realized)+'</td>';
       html += '<td class="'+pnlClass(t.unrealized)+'">'+fmtCents(t.unrealized)+'</td>';
@@ -1214,7 +1445,7 @@ function renderGames(data) {
     // ML subtotal row
     const mlPnl = game.ml_pnl || {realized:0, unrealized:0, total:0};
     html += '<tr style="border-top:2px solid #1f3a5f;background:#0d1a2d;">';
-    html += '<td colspan="6" style="text-align:right;"><span class="tag tag-ml">ML</span> <b>Subtotal</b></td>';
+    html += '<td colspan="7" style="text-align:right;"><span class="tag tag-ml">ML</span> <b>Subtotal</b></td>';
     html += '<td class="'+pnlClass(mlPnl.realized)+'">'+fmtCents(mlPnl.realized)+'</td>';
     html += '<td class="'+pnlClass(mlPnl.unrealized)+'">'+fmtCents(mlPnl.unrealized)+'</td>';
     html += '<td class="'+pnlClass(mlPnl.total)+'"><b>'+fmtCents(mlPnl.total)+fmtDollars(mlPnl.total)+'</b></td>';
@@ -1223,7 +1454,7 @@ function renderGames(data) {
     // Spread subtotal row
     const spPnl = game.spread_pnl || {realized:0, unrealized:0, total:0};
     html += '<tr style="border-top:2px solid #3b2e1a;background:#1a1508;">';
-    html += '<td colspan="6" style="text-align:right;"><span class="tag tag-spread">SPREAD</span> <b>Subtotal</b></td>';
+    html += '<td colspan="7" style="text-align:right;"><span class="tag tag-spread">SPREAD</span> <b>Subtotal</b></td>';
     html += '<td class="'+pnlClass(spPnl.realized)+'">'+fmtCents(spPnl.realized)+'</td>';
     html += '<td class="'+pnlClass(spPnl.unrealized)+'">'+fmtCents(spPnl.unrealized)+'</td>';
     html += '<td class="'+pnlClass(spPnl.total)+'"><b>'+fmtCents(spPnl.total)+fmtDollars(spPnl.total)+'</b></td>';
@@ -1232,7 +1463,7 @@ function renderGames(data) {
     // Game total row
     const gameTotal = mlPnl.total + spPnl.total;
     html += '<tr style="border-top:2px solid var(--border);background:var(--bg3);">';
-    html += '<td colspan="6" style="text-align:right;"><b>Game Total</b></td>';
+    html += '<td colspan="7" style="text-align:right;"><b>Game Total</b></td>';
     html += '<td></td><td></td>';
     html += '<td class="'+pnlClass(gameTotal)+'"><b>'+fmtCents(gameTotal)+fmtDollars(gameTotal)+'</b></td>';
     html += '</tr>';
