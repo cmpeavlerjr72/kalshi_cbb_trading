@@ -1356,6 +1356,7 @@ svg text { font-family:inherit; }
     <span class="sync" id="syncLabel">Connecting...</span>
     <label>Sport: <select id="sportSelect"><option value="all">All</option><option value="cbb">CBB</option><option value="tennis">Tennis</option></select></label>
     <label>Date: <select id="dateSelect"></select></label>
+    <label><input type="checkbox" id="hideInactive" checked> Hide Inactive</label>
   </div>
 </div>
 
@@ -1413,6 +1414,7 @@ const REFRESH_MS = 20000;
 const COLORS = {LOU:'#58a6ff',LOU2:'#3fb950',LOU5:'#d29922',UNC1:'#bc8cff'};
 const DEFAULT_COLORS = ['#58a6ff','#3fb950','#d29922','#bc8cff','#f778ba','#79c0ff'];
 let lastFetchTime = null;
+let lastData = null;
 
 function colorFor(label, idx) {
   return COLORS[label] || DEFAULT_COLORS[idx % DEFAULT_COLORS.length];
@@ -1786,7 +1788,17 @@ function renderGames(data) {
     return;
   }
 
+  const hideInactive = document.getElementById('hideInactive').checked;
+
   data.games.forEach(game => {
+    // Skip inactive games: no bid/ask on any ticker, no open positions, no capital risked
+    if (hideInactive) {
+      const hasMarket = (game.tickers||[]).some(t => t.yes_bid || t.yes_ask);
+      const hasPositions = (game.open_positions||[]).length > 0;
+      const hasRisked = (game.tickers||[]).some(t => (t.capital_risked||0) > 0);
+      if (!hasMarket && !hasPositions && !hasRisked) return;
+    }
+
     const sec = document.createElement('div');
     sec.className = 'game-section';
 
@@ -1977,6 +1989,7 @@ async function fetchData() {
       data.ml_vs_spread = mvs;
     }
 
+    lastData = data;
     renderPortfolio(data.portfolio || {});
     renderMlVsSpread(data.ml_vs_spread || {});
     renderCharts(data);
@@ -2009,6 +2022,7 @@ setInterval(fetchData, REFRESH_MS);
 setInterval(updateSync, 1000);
 document.getElementById('dateSelect').addEventListener('change', fetchData);
 document.getElementById('sportSelect').addEventListener('change', fetchData);
+document.getElementById('hideInactive').addEventListener('change', () => { if (lastData) renderGames(lastData); });
 </script>
 </body>
 </html>
