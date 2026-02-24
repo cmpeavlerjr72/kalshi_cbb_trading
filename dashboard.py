@@ -542,6 +542,14 @@ def calc_taker_fee(price_cents: int, qty: int = 1) -> float:
 # DATA PROCESSING
 # =============================================================================
 
+def compute_capital_risked(trades):
+    """Total capital deployed in cents (sum of fill_price * qty for all entries)."""
+    return sum(
+        safe_float(t.get("fill_price")) * safe_int(t.get("qty"))
+        for t in trades if t.get("action", "").startswith("entry_fill")
+    )
+
+
 def compute_open_positions(trades):
     """
     Walk trades.csv chronologically. entry_fill adds to FIFO queue,
@@ -745,6 +753,7 @@ def build_dashboard_data(date_str: str):
             "total_pnl": 0.0,
             "realized": 0.0,
             "unrealized": 0.0,
+            "capital_risked": 0.0,
             "open_count": 0,
             "wins": 0,
             "losses": 0,
@@ -753,9 +762,11 @@ def build_dashboard_data(date_str: str):
             "ml_realized": 0.0,
             "ml_unrealized": 0.0,
             "ml_total": 0.0,
+            "ml_risked": 0.0,
             "spread_realized": 0.0,
             "spread_unrealized": 0.0,
             "spread_total": 0.0,
+            "spread_risked": 0.0,
         },
         "fetch_time": datetime.now(timezone.utc).isoformat(),
     }
@@ -844,9 +855,10 @@ def build_dashboard_data(date_str: str):
             for s in closed_stats:
                 s["ticker"] = ticker_label
 
-            # Ticker-level realized / unrealized
+            # Ticker-level realized / unrealized / capital risked
             realized = sum(safe_float(r.get("net_pnl")) for r in positions)
             unrealized = sum(p.get("unrealized_pnl", 0) for p in open_pos)
+            capital_risked = compute_capital_risked(trades)
 
             # Bid/ask from latest snapshot
             yes_bid = safe_float(latest_snap.get("yes_bid")) if latest_snap else 0
@@ -878,6 +890,7 @@ def build_dashboard_data(date_str: str):
                 "open_count": len(open_pos),
                 "realized": realized,
                 "unrealized": unrealized,
+                "capital_risked": capital_risked,
                 "chart": chart_data,
                 "markers": trade_markers,
                 "mr_signal": mr_signal,
@@ -890,6 +903,7 @@ def build_dashboard_data(date_str: str):
             # Portfolio totals
             result["portfolio"]["realized"] += realized
             result["portfolio"]["unrealized"] += unrealized
+            result["portfolio"]["capital_risked"] += capital_risked
             result["portfolio"]["open_count"] += len(open_pos)
 
             for s in closed_stats:
@@ -912,16 +926,20 @@ def build_dashboard_data(date_str: str):
         # Per-game ML vs Spread aggregation
         ml_real = sum(t["realized"] for t in game_data["tickers"] if t["type"] == "ML")
         ml_unreal = sum(t["unrealized"] for t in game_data["tickers"] if t["type"] == "ML")
+        ml_risked = sum(t["capital_risked"] for t in game_data["tickers"] if t["type"] == "ML")
         sp_real = sum(t["realized"] for t in game_data["tickers"] if t["type"] == "Spread")
         sp_unreal = sum(t["unrealized"] for t in game_data["tickers"] if t["type"] == "Spread")
-        game_data["ml_pnl"] = {"realized": ml_real, "unrealized": ml_unreal, "total": ml_real + ml_unreal}
-        game_data["spread_pnl"] = {"realized": sp_real, "unrealized": sp_unreal, "total": sp_real + sp_unreal}
+        sp_risked = sum(t["capital_risked"] for t in game_data["tickers"] if t["type"] == "Spread")
+        game_data["ml_pnl"] = {"realized": ml_real, "unrealized": ml_unreal, "total": ml_real + ml_unreal, "risked": ml_risked}
+        game_data["spread_pnl"] = {"realized": sp_real, "unrealized": sp_unreal, "total": sp_real + sp_unreal, "risked": sp_risked}
 
         # Accumulate into global ML vs Spread
         result["ml_vs_spread"]["ml_realized"] += ml_real
         result["ml_vs_spread"]["ml_unrealized"] += ml_unreal
+        result["ml_vs_spread"]["ml_risked"] += ml_risked
         result["ml_vs_spread"]["spread_realized"] += sp_real
         result["ml_vs_spread"]["spread_unrealized"] += sp_unreal
+        result["ml_vs_spread"]["spread_risked"] += sp_risked
         # Skip games with no meaningful data (empty CSVs / failed runs)
         has_snapshots = any(t.get("mid", 0) != 0 for t in game_data["tickers"])
         has_trades = any(t.get("realized", 0) != 0 or t.get("open_count", 0) > 0 for t in game_data["tickers"])
@@ -936,6 +954,10 @@ def build_dashboard_data(date_str: str):
     result["portfolio"]["win_rate"] = (
         result["portfolio"]["wins"] / total if total > 0 else 0
     )
+
+    port = result["portfolio"]
+    cap = port["capital_risked"]
+    port["roi_pct"] = (port["total_pnl"] / cap * 100) if cap else 0
 
     mvs = result["ml_vs_spread"]
     mvs["ml_total"] = mvs["ml_realized"] + mvs["ml_unrealized"]
@@ -1007,9 +1029,10 @@ def get_cached_data(date_str):
         "date": date_str, "games": [],
         "fetch_time": datetime.now(timezone.utc).isoformat(),
         "portfolio": {"total_pnl": 0, "realized": 0, "unrealized": 0,
+                      "capital_risked": 0, "roi_pct": 0,
                       "open_count": 0, "wins": 0, "losses": 0, "win_rate": 0},
-        "ml_vs_spread": {"ml_realized": 0, "ml_unrealized": 0, "ml_total": 0,
-                         "spread_realized": 0, "spread_unrealized": 0, "spread_total": 0},
+        "ml_vs_spread": {"ml_realized": 0, "ml_unrealized": 0, "ml_total": 0, "ml_risked": 0,
+                         "spread_realized": 0, "spread_unrealized": 0, "spread_total": 0, "spread_risked": 0},
         "_poller": _bg_status.copy(),
     }
     return stub
@@ -1129,7 +1152,7 @@ h3 { font-size:13px; color:var(--text2); margin:6px 0 4px; }
 .sync { color:var(--text2); font-size:12px; }
 .sync.stale { color:var(--orange); }
 select { background:var(--bg3); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:3px 8px; font-family:inherit; font-size:12px; }
-.portfolio { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:10px; }
+.portfolio { display:grid; grid-template-columns:repeat(6,1fr); gap:8px; margin-bottom:10px; }
 .stat-card { background:var(--bg2); border:1px solid var(--border); border-radius:6px; padding:10px 12px; text-align:center; }
 .stat-card .label { font-size:11px; color:var(--text2); text-transform:uppercase; letter-spacing:0.5px; }
 .stat-card .value { font-size:20px; font-weight:bold; margin-top:2px; }
@@ -1179,6 +1202,7 @@ svg text { font-family:inherit; }
   <div class="stat-card"><div class="label">Total P&amp;L</div><div class="value" id="totalPnl">--</div></div>
   <div class="stat-card"><div class="label">Realized</div><div class="value" id="realized">--</div></div>
   <div class="stat-card"><div class="label">Unrealized</div><div class="value" id="unrealized">--</div></div>
+  <div class="stat-card"><div class="label">Capital Risked</div><div class="value neutral" id="capitalRisked">--</div></div>
   <div class="stat-card"><div class="label">Open Positions</div><div class="value neutral" id="openCount">--</div></div>
   <div class="stat-card"><div class="label">Win Rate</div><div class="value neutral" id="winRate">--</div></div>
 </div>
@@ -1232,6 +1256,16 @@ function fmtCents(v) {
 function fmtDollars(v) {
   if (v == null || isNaN(v)) return '';
   return ' ($' + (v/100).toFixed(2) + ')';
+}
+function fmtPct(pnl, risked) {
+  if (!risked || risked === 0) return '--';
+  const pct = (pnl / risked * 100).toFixed(1);
+  const sign = pct >= 0 ? '+' : '';
+  return sign + pct + '%';
+}
+function fmtRisked(v) {
+  if (v == null || isNaN(v) || v === 0) return '--';
+  return '$' + (v/100).toFixed(2);
 }
 function pnlClass(v) { return v > 0.05 ? 'positive' : v < -0.05 ? 'negative' : 'neutral'; }
 
@@ -1374,18 +1408,20 @@ function buildSVG(series, opts) {
 
 // ─── RENDER FUNCTIONS ───
 function renderPortfolio(p) {
+  const risked = p.capital_risked || 0;
   const tp = document.getElementById('totalPnl');
-  tp.textContent = fmtCents(p.total_pnl) + fmtDollars(p.total_pnl);
+  tp.textContent = fmtPct(p.total_pnl, risked) + ' (' + fmtCents(p.total_pnl) + ')';
   tp.className = 'value ' + pnlClass(p.total_pnl);
 
   const r = document.getElementById('realized');
-  r.textContent = fmtCents(p.realized);
+  r.textContent = fmtPct(p.realized, risked) + ' (' + fmtCents(p.realized) + ')';
   r.className = 'value ' + pnlClass(p.realized);
 
   const u = document.getElementById('unrealized');
-  u.textContent = fmtCents(p.unrealized);
+  u.textContent = fmtPct(p.unrealized, risked) + ' (' + fmtCents(p.unrealized) + ')';
   u.className = 'value ' + pnlClass(p.unrealized);
 
+  document.getElementById('capitalRisked').textContent = fmtRisked(risked);
   document.getElementById('openCount').textContent = p.open_count;
 
   const wr = document.getElementById('winRate');
@@ -1396,19 +1432,19 @@ function renderPortfolio(p) {
 function renderMlVsSpread(mvs) {
   if (!mvs) return;
   const mt = document.getElementById('mlTotal');
-  mt.textContent = fmtCents(mvs.ml_total) + fmtDollars(mvs.ml_total);
+  mt.textContent = fmtPct(mvs.ml_total, mvs.ml_risked) + ' (' + fmtCents(mvs.ml_total) + ')';
   mt.className = 'value ' + pnlClass(mvs.ml_total);
 
   const md = document.getElementById('mlDetail');
-  md.textContent = fmtCents(mvs.ml_realized) + ' / ' + fmtCents(mvs.ml_unrealized);
+  md.textContent = fmtCents(mvs.ml_realized) + ' / ' + fmtCents(mvs.ml_unrealized) + ' | Risked: ' + fmtRisked(mvs.ml_risked);
   md.className = 'value ' + pnlClass(mvs.ml_realized);
 
   const st = document.getElementById('spreadTotal');
-  st.textContent = fmtCents(mvs.spread_total) + fmtDollars(mvs.spread_total);
+  st.textContent = fmtPct(mvs.spread_total, mvs.spread_risked) + ' (' + fmtCents(mvs.spread_total) + ')';
   st.className = 'value ' + pnlClass(mvs.spread_total);
 
   const sd = document.getElementById('spreadDetail');
-  sd.textContent = fmtCents(mvs.spread_realized) + ' / ' + fmtCents(mvs.spread_unrealized);
+  sd.textContent = fmtCents(mvs.spread_realized) + ' / ' + fmtCents(mvs.spread_unrealized) + ' | Risked: ' + fmtRisked(mvs.spread_risked);
   sd.className = 'value ' + pnlClass(mvs.spread_realized);
 }
 
@@ -1543,10 +1579,11 @@ function renderGames(data) {
 
     // Ticker table
     html += '<h3>Tickers</h3>';
-    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>MR Entry</th><th>Open</th><th>Realized</th><th>Unrealized</th><th>Total</th></tr>';
+    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>MR Entry</th><th>Open</th><th>Risked</th><th>Realized</th><th>Unrealized</th><th>Total</th></tr>';
     (game.tickers||[]).forEach(t => {
       const typeTag = t.type==='ML'?'tag-ml':'tag-spread';
       const tickTotal = (t.realized||0) + (t.unrealized||0);
+      const risked = t.capital_risked||0;
       html += '<tr>';
       html += '<td><b>'+t.label+'</b></td>';
       html += '<td><span class="tag '+typeTag+'">'+t.type+'</span></td>';
@@ -1555,36 +1592,38 @@ function renderGames(data) {
       html += '<td>'+(t.spread||'--')+'</td>';
       html += '<td>'+fmtSignal(t.mr_signal)+'</td>';
       html += '<td>'+t.open_count+'</td>';
-      html += '<td class="'+pnlClass(t.realized)+'">'+fmtCents(t.realized)+'</td>';
-      html += '<td class="'+pnlClass(t.unrealized)+'">'+fmtCents(t.unrealized)+'</td>';
-      html += '<td class="'+pnlClass(tickTotal)+'"><b>'+fmtCents(tickTotal)+'</b></td>';
+      html += '<td>'+fmtRisked(risked)+'</td>';
+      html += '<td class="'+pnlClass(t.realized)+'" title="'+fmtCents(t.realized)+' on '+fmtRisked(risked)+' risked">'+fmtPct(t.realized,risked)+'</td>';
+      html += '<td class="'+pnlClass(t.unrealized)+'" title="'+fmtCents(t.unrealized)+' on '+fmtRisked(risked)+' risked">'+fmtPct(t.unrealized,risked)+'</td>';
+      html += '<td class="'+pnlClass(tickTotal)+'" title="'+fmtCents(tickTotal)+' on '+fmtRisked(risked)+' risked"><b>'+fmtPct(tickTotal,risked)+'</b></td>';
       html += '</tr>';
     });
 
     // ML subtotal row
-    const mlPnl = game.ml_pnl || {realized:0, unrealized:0, total:0};
+    const mlPnl = game.ml_pnl || {realized:0, unrealized:0, total:0, risked:0};
     html += '<tr style="border-top:2px solid #1f3a5f;background:#0d1a2d;">';
-    html += '<td colspan="7" style="text-align:right;"><span class="tag tag-ml">ML</span> <b>Subtotal</b></td>';
-    html += '<td class="'+pnlClass(mlPnl.realized)+'">'+fmtCents(mlPnl.realized)+'</td>';
-    html += '<td class="'+pnlClass(mlPnl.unrealized)+'">'+fmtCents(mlPnl.unrealized)+'</td>';
-    html += '<td class="'+pnlClass(mlPnl.total)+'"><b>'+fmtCents(mlPnl.total)+fmtDollars(mlPnl.total)+'</b></td>';
+    html += '<td colspan="8" style="text-align:right;"><span class="tag tag-ml">ML</span> <b>Subtotal</b></td>';
+    html += '<td class="'+pnlClass(mlPnl.realized)+'">'+fmtPct(mlPnl.realized,mlPnl.risked)+'</td>';
+    html += '<td class="'+pnlClass(mlPnl.unrealized)+'">'+fmtPct(mlPnl.unrealized,mlPnl.risked)+'</td>';
+    html += '<td class="'+pnlClass(mlPnl.total)+'"><b>'+fmtPct(mlPnl.total,mlPnl.risked)+' ('+fmtCents(mlPnl.total)+')</b></td>';
     html += '</tr>';
 
     // Spread subtotal row
-    const spPnl = game.spread_pnl || {realized:0, unrealized:0, total:0};
+    const spPnl = game.spread_pnl || {realized:0, unrealized:0, total:0, risked:0};
     html += '<tr style="border-top:2px solid #3b2e1a;background:#1a1508;">';
-    html += '<td colspan="7" style="text-align:right;"><span class="tag tag-spread">SPREAD</span> <b>Subtotal</b></td>';
-    html += '<td class="'+pnlClass(spPnl.realized)+'">'+fmtCents(spPnl.realized)+'</td>';
-    html += '<td class="'+pnlClass(spPnl.unrealized)+'">'+fmtCents(spPnl.unrealized)+'</td>';
-    html += '<td class="'+pnlClass(spPnl.total)+'"><b>'+fmtCents(spPnl.total)+fmtDollars(spPnl.total)+'</b></td>';
+    html += '<td colspan="8" style="text-align:right;"><span class="tag tag-spread">SPREAD</span> <b>Subtotal</b></td>';
+    html += '<td class="'+pnlClass(spPnl.realized)+'">'+fmtPct(spPnl.realized,spPnl.risked)+'</td>';
+    html += '<td class="'+pnlClass(spPnl.unrealized)+'">'+fmtPct(spPnl.unrealized,spPnl.risked)+'</td>';
+    html += '<td class="'+pnlClass(spPnl.total)+'"><b>'+fmtPct(spPnl.total,spPnl.risked)+' ('+fmtCents(spPnl.total)+')</b></td>';
     html += '</tr>';
 
     // Game total row
     const gameTotal = mlPnl.total + spPnl.total;
+    const gameRisked = (mlPnl.risked||0) + (spPnl.risked||0);
     html += '<tr style="border-top:2px solid var(--border);background:var(--bg3);">';
-    html += '<td colspan="7" style="text-align:right;"><b>Game Total</b></td>';
+    html += '<td colspan="8" style="text-align:right;"><b>Game Total</b></td>';
     html += '<td></td><td></td>';
-    html += '<td class="'+pnlClass(gameTotal)+'"><b>'+fmtCents(gameTotal)+fmtDollars(gameTotal)+'</b></td>';
+    html += '<td class="'+pnlClass(gameTotal)+'"><b>'+fmtPct(gameTotal,gameRisked)+' ('+fmtCents(gameTotal)+')</b></td>';
     html += '</tr>';
 
     html += '</table>';
