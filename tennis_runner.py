@@ -272,6 +272,11 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
             "dead_lookback": 50,         # 50 samples (~2.5 min) — tennis has longer flat
                                          # stretches during service holds before big jumps
             "dead_min_move": 2.0,        # 2c vs CBB 3c — more tolerant of quiet periods
+            "revert_min_cents": 4.0,     # 4c vs CBB 2c — hold for bigger reversion;
+                                         # tennis swings are larger so 2c bounce is noise
+            "mean_shift_exit_cents": 5.0,  # 5c vs CBB 3c — shorter lookback makes mean
+                                         # drift faster, so raise the "thesis collapsed"
+                                         # threshold to avoid premature exits
         }
 
         strategies = [
