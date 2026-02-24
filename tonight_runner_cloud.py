@@ -239,6 +239,31 @@ class R2Uploader:
             print_status(f"[R2] Uploaded {uploaded} file(s)")
         return uploaded
 
+    CONFIG_R2_KEY = "kalshi/config/strategy_config.json"
+
+    def download_config(self, local_path: Path) -> bool:
+        """Download strategy_config.json from R2 if content changed. Returns True if file was updated."""
+        if not self.enabled():
+            return False
+        try:
+            resp = self._client.get_object(Bucket=self.bucket, Key=self.CONFIG_R2_KEY)
+            data = resp["Body"].read()
+        except Exception as e:
+            if "NoSuchKey" in str(type(e).__name__) or "NoSuchKey" in str(e):
+                return False
+            print_status(f"[R2] download_config error: {e}")
+            return False
+
+        new_hash = hashlib.sha256(data).hexdigest()
+        if local_path.exists():
+            existing_hash = hashlib.sha256(local_path.read_bytes()).hexdigest()
+            if existing_hash == new_hash:
+                return False
+
+        local_path.write_bytes(data)
+        print_status(f"[R2] Config updated: {local_path}")
+        return True
+
     def write_index(self, extra: Optional[Dict[str, Any]] = None) -> None:
         """
         Writes a small index.json into the logs folder (and then uploader sync will ship it).
@@ -683,6 +708,7 @@ def uploader_loop(stop: StopFlag, uploader: R2Uploader, interval_secs: int = 20)
     print_status(f"[R2] Uploader thread started (interval={interval_secs}s)")
     while not stop.is_set():
         try:
+            uploader.download_config(Path("strategy_config.json"))
             uploader.write_index()
             uploader.upload_changed()
         except Exception as e:
