@@ -254,13 +254,12 @@ def compute_mr_signal(snapshots, sport="cbb"):
     Compute MR proximity from snapshot mid values.
     Uses sport-specific params matching the live strategy.
     """
-    # Sport-specific params
+    # Match live strategy: deque maxlen=120 for all sports (set at __init__),
+    # tennis std_mult overrides applied via update_params after init.
     if sport == "tennis":
-        lookback = 80
         low_vol_std_mult = 3.0
         high_vol_std_mult = 2.0
     else:
-        lookback = 120
         low_vol_std_mult = 2.5
         high_vol_std_mult = 1.5
 
@@ -277,7 +276,7 @@ def compute_mr_signal(snapshots, sport="cbb"):
     if len(mids) < 10:
         return None
 
-    window = mids[-lookback:]
+    window = mids[-120:]  # deque maxlen=120 for all sports
     n = len(window)
     mean = sum(window) / n
     variance = sum((x - mean) ** 2 for x in window) / n
@@ -316,13 +315,22 @@ def compute_mr_series(snapshots, sport="cbb", trade_markers=None):
     Returns list of {time, mid, mean, upper, lower} dicts.
     Downsamples to ~500 points but always preserves snapshots near trade times.
     """
-    # Sport-specific params matching production_strategies.py / tennis_runner.py
+    # Sport-specific params matching the LIVE strategy behaviour.
+    #
+    # KEY BUG: tennis_runner calls update_params(lookback=80) AFTER __init__
+    # already created self.prices = deque(maxlen=120).  update_params changes
+    # self.params["lookback"] but NOT the deque maxlen.  So the live strategy
+    # computes _calc_stats() over up to 120 samples for tennis, even though
+    # warmup_samples=80 lets it start trading after only 80 samples.
+    # We replicate this exact behaviour so chart bands match reality.
     if sport == "tennis":
-        lookback = 80
+        deque_maxlen = 120   # actual deque capacity (set at __init__ time)
+        warmup = 80          # warmup_samples (set by update_params)
         low_vol_std_mult = 3.0
         high_vol_std_mult = 2.0
     else:
-        lookback = 120
+        deque_maxlen = 120
+        warmup = 120
         low_vol_std_mult = 2.5
         high_vol_std_mult = 1.5
     low_vol_cutoff = 5.0
@@ -339,16 +347,17 @@ def compute_mr_series(snapshots, sport="cbb", trade_markers=None):
             continue
         points.append((s.get("timestamp", ""), mid))
 
-    if len(points) < lookback:
+    if len(points) < warmup:
         return []
 
-    # Compute rolling stats at every point
+    # Compute rolling stats at every point — match live deque behaviour:
+    # window = last deque_maxlen samples, but start after warmup samples
     mids = [p[1] for p in points]
     full = []
     for i in range(len(points)):
-        window = mids[max(0, i - lookback + 1):i + 1]
-        if len(window) < lookback:
-            continue  # skip warmup
+        window = mids[max(0, i - deque_maxlen + 1):i + 1]
+        if i + 1 < warmup:
+            continue  # skip warmup period
         n = len(window)
         mean = sum(window) / n
         variance = sum((x - mean) ** 2 for x in window) / n
