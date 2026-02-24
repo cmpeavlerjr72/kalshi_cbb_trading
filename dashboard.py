@@ -1703,8 +1703,10 @@ function buildMRSVG(mrSeries, markers, opts) {
   const allX = pts.map(p => p.x);
   let allY = [];
   pts.forEach(p => { allY.push(p.mid, p.upper, p.lower); });
-  // Include marker prices in Y range
-  if (markers) markers.forEach(m => { allY.push(m.price); });
+  // Include marker prices in Y range (convert NO-side to YES scale)
+  if (markers) markers.forEach(m => {
+    allY.push(m.side === 'no' ? 100 - m.price : m.price);
+  });
 
   let xMin = Math.min(...allX), xMax = Math.max(...allX);
   let yMin = Math.min(...allY), yMax = Math.max(...allY);
@@ -1761,11 +1763,12 @@ function buildMRSVG(mrSeries, markers, opts) {
   pts.forEach((p,i) => { midD += (i?'L':'') + sx(p.x).toFixed(1)+','+sy(p.mid).toFixed(1)+' '; });
   svg += '<path d="'+midD+'" fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round"/>';
 
-  // Trade markers
+  // Trade markers — convert NO-side fill prices to YES scale (chart shows YES mid)
   if (markers && markers.length > 0) {
     markers.forEach(m => {
       const mx = sx((new Date(m.time).getTime() - refTime) / 60000);
-      const my = sy(m.price);
+      const price = m.side === 'no' ? 100 - m.price : m.price;
+      const my = sy(price);
       if (mx < pad.left || mx > W - pad.right) return;
       if (m.type === 'entry') {
         svg += '<polygon points="'+(mx-5)+','+(my+5)+' '+mx+','+(my-5)+' '+(mx+5)+','+(my+5)+'" fill="'+(m.side==='yes'?'#3fb950':'#f85149')+'" opacity="0.9"/>';
