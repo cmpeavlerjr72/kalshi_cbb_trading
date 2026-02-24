@@ -269,12 +269,19 @@ def compute_mr_signal(snapshots):
 
     pct = abs(deviation) / threshold * 100 if threshold > 0 else 0
 
+    # Trigger prices: the mid price that would fire an MR entry
+    yes_trigger = round(mean - threshold, 1)  # mid drops here → buy YES
+    no_trigger = round(mean + threshold, 1)   # mid rises here → buy NO
+
     return {
         "mr_mean": round(mean, 2),
         "mr_std": round(std, 2),
         "mr_threshold": round(threshold, 2),
         "mr_deviation": round(deviation, 2),
         "mr_pct": round(min(pct, 999), 1),
+        "yes_trigger": yes_trigger,
+        "no_trigger": no_trigger,
+        "current_mid": round(mids[-1], 1),
     }
 
 
@@ -1295,24 +1302,24 @@ function fmtAge(secs) {
 }
 
 function fmtSignal(sig) {
-  // MR signal: how close is the mid price to triggering a mean-reversion entry?
-  // Below mean → would buy YES (bet price reverts up)
-  // Above mean → would buy NO (bet price reverts down)
+  // MR signal: show the trigger price needed for next entry
+  // Below mean → would buy YES at yes_trigger price
+  // Above mean → would buy NO at no_trigger price
   if (!sig) return '<span style="color:var(--text2)">--</span>';
   if (sig.status === 'dead') return '<span style="color:var(--text2)" title="Price not moving enough for MR">FLAT</span>';
   const dev = sig.mr_deviation;
-  const thr = sig.mr_threshold;
   const pct = sig.mr_pct;
-  // Which side the MR strategy would buy
+  const mid = sig.current_mid;
+  // Which side is closer to triggering
   const side = dev < 0 ? 'YES' : 'NO';
   const sideColor = dev < 0 ? '#3fb950' : '#f85149';
-  const dist = Math.abs(Math.abs(dev) - thr).toFixed(1);
+  const triggerPrice = dev < 0 ? sig.yes_trigger : sig.no_trigger;
 
   if (pct >= 100) {
-    return '<span style="color:'+sideColor+';font-weight:bold;" title="Mid is '+Math.abs(dev).toFixed(1)+'c from mean (threshold: '+thr.toFixed(1)+'c)">BUY '+side+'</span>';
+    return '<span style="color:'+sideColor+';font-weight:bold;" title="Mid '+mid+'c hit trigger '+triggerPrice+'c">BUY '+side+'</span>';
   }
   // Color ramp: far from trigger → close to trigger
-  let color = '#3fb950';
+  let color = '#8b949e';
   if (pct >= 95) color = '#f85149';
   else if (pct >= 80) color = '#d29922';
   else if (pct >= 50) color = '#e3b341';
@@ -1321,7 +1328,7 @@ function fmtSignal(sig) {
   const barW = Math.min(pct, 100);
   const bar = '<span style="display:inline-block;width:40px;height:6px;background:var(--bg3);border-radius:3px;vertical-align:middle;margin-left:4px;">'
     + '<span style="display:block;width:'+barW+'%;height:100%;background:'+color+';border-radius:3px;"></span></span>';
-  return '<span style="color:'+color+'" title="Mid is '+Math.abs(dev).toFixed(1)+'c from mean (need '+thr.toFixed(1)+'c to trigger '+side+' entry)">'+dist+'c to '+side+bar+'</span>';
+  return '<span style="color:'+color+'" title="Mid: '+mid+'c | Mean: '+sig.mr_mean+'c | '+side+' trigger: '+triggerPrice+'c">'+side+' @ '+triggerPrice+'c'+bar+'</span>';
 }
 
 // ─── SVG CHART HELPER ───
