@@ -111,16 +111,12 @@ _cache = R2Cache(ttl_secs=15)
 # ESPN SCORE FETCHING
 # =============================================================================
 
-def _fetch_all_scores(espn_date):
-    """
-    Fetch ESPN scoreboard for a date, return {TEAM_ABBR: score_info}.
-    One request covers all games on that date; cached 15s via _cache.
-    """
-    cache_key = f"__espn_scores__{espn_date}"
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
+_espn_bg_lock = threading.Lock()
+_espn_bg_pending = set()  # dates currently being fetched in background
 
+
+def _fetch_all_scores_sync(espn_date):
+    """Blocking ESPN fetch — called from background thread."""
     try:
         url = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
         resp = _requests.get(url, params={"dates": espn_date, "groups": "50", "limit": "500"},
@@ -134,10 +130,9 @@ def _fetch_all_scores(espn_date):
         comp = (ev.get("competitions") or [{}])[0]
         competitors = comp.get("competitors") or []
 
-        # Extract status
         status_obj = comp.get("status") or ev.get("status") or {}
         typ = status_obj.get("type") or {}
-        state = (typ.get("state") or "").lower()  # pre/in/post
+        state = (typ.get("state") or "").lower()
         completed = bool(typ.get("completed"))
         period = 0
         clock_str = ""
@@ -148,7 +143,7 @@ def _fetch_all_scores(espn_date):
         clock_str = status_obj.get("displayClock") or ""
 
         if completed or state == "post":
-            clock_display = "Final" + (f" (OT)" if period > 2 else "")
+            clock_display = "Final" + (" (OT)" if period > 2 else "")
         elif state == "pre":
             clock_display = "Pre-game"
         elif state == "in":
@@ -163,7 +158,6 @@ def _fetch_all_scores(espn_date):
         else:
             clock_display = "--"
 
-        # Build teams dict {ABBR: score}
         teams = {}
         for c in competitors:
             abbr = (c.get("team", {}).get("abbreviation") or "").upper()
@@ -174,13 +168,33 @@ def _fetch_all_scores(espn_date):
                 teams[abbr] = None
 
         info = {"teams": teams, "clock_display": clock_display, "state": state, "period": period}
-
-        # Index by every team abbreviation in this event
         for abbr in teams:
             scores[abbr] = info
 
+    cache_key = f"__espn_scores__{espn_date}"
     _cache.put(cache_key, scores)
+    with _espn_bg_lock:
+        _espn_bg_pending.discard(espn_date)
     return scores
+
+
+def _fetch_all_scores(espn_date):
+    """
+    Non-blocking ESPN fetch. Returns cached scores immediately if available,
+    otherwise kicks off a background thread and returns {} (scores appear next refresh).
+    """
+    cache_key = f"__espn_scores__{espn_date}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Kick off background fetch if not already running
+    with _espn_bg_lock:
+        if espn_date not in _espn_bg_pending:
+            _espn_bg_pending.add(espn_date)
+            threading.Thread(target=_fetch_all_scores_sync, args=(espn_date,), daemon=True).start()
+
+    return {}
 
 
 def _get_game_score(game_key):
