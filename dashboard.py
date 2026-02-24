@@ -952,22 +952,16 @@ _bg_data = {}       # date_str -> full dashboard payload
 _bg_data_lock = threading.Lock()
 _bg_active_date = None  # date the poller is currently refreshing
 _bg_wake = threading.Event()  # signal poller to fetch immediately
-
-_EMPTY_PAYLOAD = lambda date_str: {
-    "date": date_str, "games": [],
-    "fetch_time": datetime.now(timezone.utc).isoformat(),
-    "portfolio": {"total_pnl": 0, "realized": 0, "unrealized": 0,
-                  "open_count": 0, "wins": 0, "losses": 0, "win_rate": 0},
-    "ml_vs_spread": {"ml_realized": 0, "ml_unrealized": 0, "ml_total": 0,
-                     "spread_realized": 0, "spread_unrealized": 0, "spread_total": 0},
-}
+_bg_status = {"state": "init", "last_error": None, "last_ok": None, "cycles": 0}
 
 
 def _bg_poller():
     """Background thread: rebuilds dashboard data, then waits 15s or until woken."""
+    global _bg_status
     while True:
         date_str = _bg_active_date
         if date_str:
+            _bg_status["state"] = f"fetching {date_str}"
             try:
                 t0 = time.time()
                 payload = build_dashboard_data(date_str)
@@ -975,9 +969,20 @@ def _bg_poller():
                 with _bg_data_lock:
                     _bg_data[date_str] = payload
                 ng = len(payload.get("games", []))
-                print(f"[poller] Refreshed {date_str}: {ng} games in {elapsed:.1f}s")
+                _bg_status["state"] = "idle"
+                _bg_status["last_ok"] = f"{ng} games in {elapsed:.1f}s"
+                _bg_status["last_error"] = None
+                _bg_status["cycles"] += 1
+                print(f"[poller] Refreshed {date_str}: {ng} games in {elapsed:.1f}s", flush=True)
             except Exception as e:
-                print(f"[poller] Error building data for {date_str}: {e}")
+                import traceback
+                _bg_status["state"] = "error"
+                _bg_status["last_error"] = str(e)
+                _bg_status["cycles"] += 1
+                print(f"[poller] Error building data for {date_str}: {e}", flush=True)
+                traceback.print_exc()
+        else:
+            _bg_status["state"] = "waiting for date"
         _bg_wake.wait(timeout=15)
         _bg_wake.clear()
 
@@ -994,7 +999,20 @@ def get_cached_data(date_str):
     with _bg_data_lock:
         cached = _bg_data.get(date_str)
 
-    return cached if cached else _EMPTY_PAYLOAD(date_str)
+    if cached:
+        cached["_poller"] = _bg_status.copy()
+        return cached
+
+    stub = {
+        "date": date_str, "games": [],
+        "fetch_time": datetime.now(timezone.utc).isoformat(),
+        "portfolio": {"total_pnl": 0, "realized": 0, "unrealized": 0,
+                      "open_count": 0, "wins": 0, "losses": 0, "win_rate": 0},
+        "ml_vs_spread": {"ml_realized": 0, "ml_unrealized": 0, "ml_total": 0,
+                         "spread_realized": 0, "spread_unrealized": 0, "spread_total": 0},
+        "_poller": _bg_status.copy(),
+    }
+    return stub
 
 
 # =============================================================================
