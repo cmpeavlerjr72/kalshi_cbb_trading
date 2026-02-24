@@ -1449,43 +1449,47 @@ function renderCharts(data) {
   let pnlSeries = [];
   pnlLegend.innerHTML = '';
 
-  let mlCumByTime = {};
-  let spCumByTime = {};
-  let totalCumByTime = {};
-
+  // Collect per-ticker trade events grouped by ML/Spread
+  let mlTickerSeries = [];
+  let spTickerSeries = [];
   allTickers.forEach(t => {
-    (t.chart?.pnl_series||[]).forEach(p => {
-      const x = isoToMinutes(p.time, refTime).toFixed(2);
-      if (!totalCumByTime[x]) totalCumByTime[x] = 0;
-      totalCumByTime[x] += p.cum_pnl;
-      if (t.type === 'ML') {
-        if (!mlCumByTime[x]) mlCumByTime[x] = 0;
-        mlCumByTime[x] += p.cum_pnl;
-      } else {
-        if (!spCumByTime[x]) spCumByTime[x] = 0;
-        spCumByTime[x] += p.cum_pnl;
-      }
-    });
+    const pts = (t.chart?.pnl_series||[]).map(p => ({x: isoToMinutes(p.time, refTime), cum: p.cum_pnl}));
+    if (pts.length === 0) return;
+    if (t.type === 'ML') mlTickerSeries.push(pts);
+    else spTickerSeries.push(pts);
   });
 
-  // ML total line
-  const mlSorted = Object.entries(mlCumByTime).map(([x,y])=>({x:parseFloat(x),y})).sort((a,b)=>a.x-b.x);
-  if (mlSorted.length > 0) {
-    pnlSeries.push({label:'All ML', color:'#58a6ff', points:mlSorted, isTotal:false});
+  // Build a proper cumulative line across multiple tickers:
+  // At each trade event, sum every ticker's latest cum_pnl (carry forward between trades)
+  function buildCumLine(groups) {
+    let events = [];
+    groups.forEach((pts, idx) => { pts.forEach(p => events.push({x:p.x, idx:idx, cum:p.cum})); });
+    if (events.length === 0) return [];
+    events.sort((a,b) => a.x - b.x);
+    let last = new Array(groups.length).fill(0);
+    let out = [];
+    events.forEach(e => {
+      last[e.idx] = e.cum;
+      let sum = 0; for (let i=0;i<last.length;i++) sum += last[i];
+      out.push({x:e.x, y:sum});
+    });
+    return out;
+  }
+
+  const mlPoints = buildCumLine(mlTickerSeries);
+  const spPoints = buildCumLine(spTickerSeries);
+  const totalPoints = buildCumLine([...mlTickerSeries, ...spTickerSeries]);
+
+  if (mlPoints.length > 0) {
+    pnlSeries.push({label:'All ML', color:'#58a6ff', points:mlPoints, isTotal:false});
     pnlLegend.innerHTML += '<span class="legend-item"><span class="legend-dot" style="background:#58a6ff"></span>All ML</span>';
   }
-
-  // Spread total line
-  const spSorted = Object.entries(spCumByTime).map(([x,y])=>({x:parseFloat(x),y})).sort((a,b)=>a.x-b.x);
-  if (spSorted.length > 0) {
-    pnlSeries.push({label:'All Spread', color:'#d29922', points:spSorted, isTotal:false});
+  if (spPoints.length > 0) {
+    pnlSeries.push({label:'All Spread', color:'#d29922', points:spPoints, isTotal:false});
     pnlLegend.innerHTML += '<span class="legend-item"><span class="legend-dot" style="background:#d29922"></span>All Spread</span>';
   }
-
-  // Portfolio total line
-  const totalSorted = Object.entries(totalCumByTime).map(([x,y])=>({x:parseFloat(x),y})).sort((a,b)=>a.x-b.x);
-  if (totalSorted.length > 0) {
-    pnlSeries.push({label:'Total', color:'#e6edf3', points:totalSorted, isTotal:true});
+  if (totalPoints.length > 0) {
+    pnlSeries.push({label:'Total', color:'#e6edf3', points:totalPoints, isTotal:true});
     pnlLegend.innerHTML += '<span class="legend-item"><span class="legend-dot" style="background:#e6edf3"></span><b>Total</b></span>';
   }
 
