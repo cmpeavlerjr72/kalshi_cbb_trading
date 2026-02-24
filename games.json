@@ -108,5 +108,16 @@
     "espn_team": "SLU",
     "espn_opponent": "DAY",
     "spread_tickers": []
+  },
+  {
+    "label": "Old Dominion at Marshall",
+    "team_name": "ODU",
+    "model_p_win": 0.50,
+    "partner_p_win": 0.50,
+    "segment": "Away Fav",
+    "espn_date": "20260224",
+    "espn_team": "ODU",
+    "espn_opponent": "MRSH",
+    "spread_tickers": []
   }
 ]
