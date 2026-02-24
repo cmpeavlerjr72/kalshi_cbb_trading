@@ -477,6 +477,7 @@ def _run_sub_ticker(
     log_dir: Path,
     sub_results: Dict[str, Any],
     maker_entries: bool = False,
+    maker_exits: bool = False,
     min_entry_price: int = 0,
 ):
     """Run a single GameRunner for one ticker. Called in its own thread."""
@@ -493,6 +494,7 @@ def _run_sub_ticker(
             espn_clock=espn_clock,
             log_dir=str(sub_log_dir),
             maker_entries=maker_entries,
+            maker_exits=maker_exits,
             min_entry_price=min_entry_price,
         )
 
@@ -566,6 +568,16 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
             f"Preferred:{preferred_side.upper()}"
         )
 
+        # --- Load strategy config overrides ---
+        strategy_config_overrides = {}
+        try:
+            cfg_path = REPO_ROOT / "strategy_config.json"
+            if cfg_path.exists():
+                strategy_config_overrides = json.loads(cfg_path.read_text(encoding="utf-8"))
+                print_status(f"[{label}] Loaded strategy config from {cfg_path}")
+        except Exception as e:
+            print_status(f"[{label}] ⚠ Failed to load strategy_config.json: {e}")
+
         # --- Build strategies + spawn sub-threads per ticker ---
         sub_results: Dict[str, Any] = {}
         sub_threads: List[threading.Thread] = []
@@ -596,6 +608,12 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
                     exposure_tracker=exposure,
                 ),
             ]
+            # Apply config overrides from strategy_config.json
+            for strat in strategies:
+                overrides = strategy_config_overrides.get(strat.name, {})
+                if overrides:
+                    strat.update_params(overrides)
+
             ticker_type = "SPREAD" if is_spread else "ML"
             print_status(
                 f"[{label}/{ticker_label}] {ticker_type} | "
@@ -616,6 +634,7 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any]):
                     log_dir=log_dir,
                     sub_results=sub_results,
                     maker_entries=True,
+                    maker_exits=True,
                     min_entry_price=20,
                 ),
                 name=f"{label}/{ticker_label}",

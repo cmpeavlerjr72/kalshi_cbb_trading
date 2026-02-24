@@ -1,0 +1,22 @@
+{
+  "mean_reversion": {
+    "lookback": 120,
+    "warmup_samples": 120,
+    "high_vol_std_mult": 1.5,
+    "low_vol_std_mult": 2.5,
+    "low_vol_cutoff": 5.0,
+    "revert_sigma_frac": 0.5,
+    "revert_min_cents": 2.0,
+    "profit_defense_activate_cents": 10.0,
+    "profit_defense_giveback_frac": 0.50,
+    "profit_defense_giveback_frac_high": 0.30,
+    "mean_shift_exit_cents": 3.0,
+    "directional_close_secs": 300,
+    "size_sigma_floor": 1.5,
+    "size_sigma_cap": 3.0,
+    "size_base_frac": 0.35,
+    "size_max_frac": 0.80,
+    "side_cooldown_secs": 20,
+    "max_positions": 4
+  }
+}

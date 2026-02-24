@@ -38,6 +38,8 @@ from combo_vnext import (
     place_limit_sell,
     wait_for_fill_or_timeout,
     has_fill_liquidity_for_implied_buy,
+    cancel_order,
+    fetch_fills_for_order,
     SERIES_TICKER,
     MIN_LIQUIDITY_CONTRACTS,
 )
@@ -267,6 +269,10 @@ class BaseStrategy(ABC):
 
         return True, "ok"
 
+    def update_params(self, overrides: dict):
+        """Hot-reload: merge new param values into existing params."""
+        self.params.update(overrides)
+
     def _side_on_cooldown(self, side: str) -> Tuple[bool, str]:
         """P1: Check if a side is on post-stop cooldown"""
         last_stop = self._side_last_stop.get(side)
@@ -441,11 +447,14 @@ class MeanReversionStrategy(BaseStrategy):
     def __init__(self, max_capital: float, preferred_side: Optional[str] = None,
                  exposure_tracker: Optional["ExposureTracker"] = None):
         params = {
-            "lookback": 60,
+            "lookback": 120,
             "high_vol_std_mult": 1.5,
             "low_vol_std_mult": 2.5,
             "low_vol_cutoff": 5.0,
-            "reversion_exit_pnl_floor": -3,
+
+            # Revert exit: proportional to volatility (0.5σ, min 2c)
+            "revert_sigma_frac": 0.5,
+            "revert_min_cents": 2.0,
 
             # stop loss intentionally unused / OFF
             "stop_loss": 0,
@@ -459,8 +468,8 @@ class MeanReversionStrategy(BaseStrategy):
             # IMPORTANT: allow entries into late game; directional filter controls safety
             "stop_trading_before_close_secs": 0,
 
-            # warmup / dead-market checks (unchanged)
-            "warmup_samples": 60,
+            # warmup / dead-market checks
+            "warmup_samples": 120,
             "warmup_min_range": 5.0,
             "dead_lookback": 30,
             "dead_min_move": 3.0,
@@ -740,7 +749,9 @@ class MeanReversionStrategy(BaseStrategy):
         mid = (yes_bid + (yes_ask or yes_bid)) / 2
         mean, std = self._calc_stats()
 
-        pnl_floor = float(self.params.get("reversion_exit_pnl_floor", -3))
+        revert_sigma_frac = float(self.params.get("revert_sigma_frac", 0.5))
+        revert_min_cents = float(self.params.get("revert_min_cents", 2.0))
+        revert_dist = max(revert_min_cents, revert_sigma_frac * std)
 
         if position.side == "yes":
             pnl = float(yes_bid) - float(position.entry_price)
@@ -758,19 +769,16 @@ class MeanReversionStrategy(BaseStrategy):
             if position.max_fav_pnl_cents >= activate:
                 floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
                 if pnl <= max(min_keep, floor):
-                    return True, "take_profit", max(1, int(yes_bid) - 1), \
+                    return True, "profit_defense", max(1, int(yes_bid) - 1), \
                         f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c gb={giveback_frac:.0%}"
 
             # 2a: mean-shift exit (broken thesis)
             ms_exit, ms_reason = self._check_mean_shift_exit(position)
-            if ms_exit and pnl > pnl_floor:
-                return True, "take_profit", max(1, int(yes_bid) - 1), ms_reason
+            if ms_exit:
+                return True, "mean_shift", max(1, int(yes_bid) - 1), ms_reason
 
-            if pnl < pnl_floor:
-                return False, "", 0, f"hold_pnl_floor:{pnl:.0f}c<{pnl_floor:.0f}c"
-
-            if mid >= mean - 2:
-                return True, "take_profit", max(1, int(yes_bid) - 1), f"reverted:{pnl:.0f}c"
+            if mid >= mean - revert_dist:
+                return True, "revert", max(1, int(yes_bid) - 1), f"reverted:{pnl:.0f}c(dist={revert_dist:.1f})"
 
         else:
             if no_bid is not None:
@@ -788,19 +796,16 @@ class MeanReversionStrategy(BaseStrategy):
                 if position.max_fav_pnl_cents >= activate:
                     floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
                     if pnl <= max(min_keep, floor):
-                        return True, "take_profit", max(1, int(no_bid) - 1), \
+                        return True, "profit_defense", max(1, int(no_bid) - 1), \
                             f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c gb={giveback_frac:.0%}"
 
                 # 2a: mean-shift exit (broken thesis)
                 ms_exit, ms_reason = self._check_mean_shift_exit(position)
-                if ms_exit and pnl > pnl_floor:
-                    return True, "take_profit", max(1, int(no_bid) - 1), ms_reason
+                if ms_exit:
+                    return True, "mean_shift", max(1, int(no_bid) - 1), ms_reason
 
-                if pnl < pnl_floor:
-                    return False, "", 0, f"hold_pnl_floor:{pnl:.0f}c<{pnl_floor:.0f}c"
-
-                if mid <= mean + 2:
-                    return True, "take_profit", max(1, int(no_bid) - 1), f"reverted:{pnl:.0f}c"
+                if mid <= mean + revert_dist:
+                    return True, "revert", max(1, int(no_bid) - 1), f"reverted:{pnl:.0f}c(dist={revert_dist:.1f})"
 
         return False, "", 0, "hold"
 
@@ -1357,6 +1362,7 @@ class GameRunner:
         espn_clock=None,
         log_dir: Optional[str] = None,
         maker_entries: bool = False,
+        maker_exits: bool = False,
         min_entry_price: int = 0,
     ):
         self.label = game_label
@@ -1367,6 +1373,7 @@ class GameRunner:
         self.close_time = parse_iso(market["close_time"])
         self.espn_clock = espn_clock
         self.maker_entries = maker_entries
+        self.maker_exits = maker_exits
         self.min_entry_price = min_entry_price
 
         # P3: Market quality monitor
@@ -1390,30 +1397,42 @@ class GameRunner:
         self._init_logs()
         self.snapshots = 0
 
+        # Live config reload
+        self._config_path = Path("strategy_config.json")
+        self._last_config_mtime = 0.0
+        self._config_check_interval = 10  # check every 10 loop iterations (~30s)
+
     def _init_logs(self):
-        with open(self.snapshot_path, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
+        is_restart = False
+        for path, headers in [
+            (self.snapshot_path, [
                 "timestamp", "ticker", "secs_to_close", "clock_source",
                 "yes_bid", "yes_ask", "no_bid", "no_ask", "mid", "spread",
-                "mq_std", "mq_tradeable","espn_live_win_pct", "game_progress", "secs_to_tip",
-            ])
-        with open(self.trade_path, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
+                "mq_std", "mq_tradeable", "espn_live_win_pct", "game_progress", "secs_to_tip",
+            ]),
+            (self.trade_path, [
                 "timestamp", "ticker", "strategy", "action", "side",
                 "intended_price", "fill_price", "qty", "fee_cents",
                 "reason", "order_id",
-            ])
-        with open(self.position_path, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
+            ]),
+            (self.position_path, [
                 "position_id", "strategy", "side",
                 "entry_price", "entry_time", "entry_fee",
                 "exit_price", "exit_time", "exit_type", "exit_fee",
                 "lock_price", "gross_pnl", "net_pnl", "hold_secs",
-            ])
-        with open(self.event_path, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
+            ]),
+            (self.event_path, [
                 "timestamp", "strategy", "event", "detail",
-            ])
+            ]),
+        ]:
+            if path.exists() and path.stat().st_size > 0:
+                is_restart = True
+            else:
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(headers)
+
+        if is_restart:
+            self._log_event("system", "runner_restart", f"Appending to existing logs in {self.log_dir}")
 
     def _log_orderbook(self, ob: Dict[str, Any], secs_to_close: float, clock_source: str, depth: int = 25):
         """
@@ -1550,6 +1569,9 @@ class GameRunner:
         self._log_event(strategy.name, f"exit_{exit_type}_attempt", f"{position.side}@{price}c {reason}")
 
         lock_price = None
+        use_maker = (self.maker_exits and exit_type not in ("timeout", "lock"))
+        mode = "maker" if use_maker else "taker"
+
         try:
             if exit_type == "lock":
                 lock_side = "no" if position.side == "yes" else "yes"
@@ -1562,20 +1584,88 @@ class GameRunner:
                     print_status(f"[{self.label}][{strategy.name}] LOCK NO FILL")
                     self._log_event(strategy.name, "lock_nofill", f"{lock_side}@{price}c")
                     return None
+
+            elif use_maker:
+                # Maker exit: place sell at bid+1 (resting on the book)
+                ob = fetch_orderbook(self.ticker)
+                px = derive_prices(ob)
+                bid_key = "best_yes_bid" if position.side == "yes" else "best_no_bid"
+                ask_key = "imp_yes_ask" if position.side == "yes" else "imp_no_ask"
+                fresh_bid = px.get(bid_key)
+                fresh_ask = px.get(ask_key)
+
+                if fresh_bid is None:
+                    print_status(f"[{self.label}][{strategy.name}] MAKER EXIT SKIP — no bid")
+                    self._log_event(strategy.name, "exit_skip_maker_nobid", f"{position.side}")
+                    # Fall through to taker
+                    use_maker = False
+                else:
+                    maker_price = int(fresh_bid) + 1
+                    if fresh_ask is not None and maker_price >= int(fresh_ask):
+                        print_status(f"[{self.label}][{strategy.name}] MAKER EXIT SKIP — spread=0 (bid+1={maker_price} >= ask={fresh_ask})")
+                        self._log_event(strategy.name, "exit_skip_maker_spread0", f"{position.side} bid+1={maker_price} ask={fresh_ask}")
+                        use_maker = False
+                    else:
+                        order_id = place_limit_sell(self.private_key, self.ticker, position.side, maker_price, position.qty)
+                        filled, vwap = wait_for_fill_or_timeout(self.private_key, order_id, position.side, max_wait_secs=45)
+                        if filled > 0:
+                            actual_exit = vwap if vwap else float(maker_price)
+                            fee = 0.0
+                            print_status(f"[{self.label}][{strategy.name}] FILLED [maker] exit @ {actual_exit:.1f}c (fee=0)")
+                        else:
+                            # Cancel maker, fall back to taker
+                            print_status(f"[{self.label}][{strategy.name}] MAKER EXIT NO FILL — falling back to taker")
+                            self._log_event(strategy.name, "exit_maker_nofill_fallback", f"{position.side}@{maker_price}c")
+                            try:
+                                cancel_order(self.private_key, order_id)
+                            except Exception:
+                                pass
+                            use_maker = False
+
+                # Taker fallback if maker failed
+                if not use_maker and exit_type != "lock":
+                    mode = "taker"
+                    ob = fetch_orderbook(self.ticker)
+                    px = derive_prices(ob)
+                    bid_key = "best_yes_bid" if position.side == "yes" else "best_no_bid"
+                    fresh_bid = px.get(bid_key)
+                    if fresh_bid is None:
+                        print_status(f"[{self.label}][{strategy.name}] EXIT NO BID — cannot sell")
+                        self._log_event(strategy.name, "exit_nofill", f"{position.side} no_bid")
+                        return None
+                    taker_price = max(1, int(fresh_bid) - 1)
+                    order_id = place_limit_sell(self.private_key, self.ticker, position.side, taker_price, position.qty)
+                    filled, vwap = wait_for_fill_or_timeout(self.private_key, order_id, position.side, max_wait_secs=15)
+                    if filled > 0:
+                        actual_exit = vwap if vwap else float(taker_price)
+                        fee = calc_taker_fee(int(actual_exit), position.qty)
+                    else:
+                        print_status(f"[{self.label}][{strategy.name}] EXIT NO FILL [taker fallback]")
+                        self._log_event(strategy.name, "exit_nofill", f"{position.side}@{taker_price}c")
+                        return None
+
             else:
+                # Standard taker exit
                 order_id = place_limit_sell(self.private_key, self.ticker, position.side, price, position.qty)
                 filled, vwap = wait_for_fill_or_timeout(self.private_key, order_id, position.side, max_wait_secs=15)
                 if filled > 0:
                     actual_exit = vwap if vwap else float(price)
+                    fee = calc_taker_fee(int(actual_exit), position.qty)
                 else:
                     print_status(f"[{self.label}][{strategy.name}] EXIT NO FILL")
                     self._log_event(strategy.name, "exit_nofill", f"{position.side}@{price}c")
                     return None
 
             closed = strategy.record_exit(position, exit_type, actual_exit, lock_price)
-            fee = calc_taker_fee(int(actual_exit), position.qty)
-            print_status(f"[{self.label}][{strategy.name}] CLOSED: net={closed.net_pnl:.1f}c")
-            self._log_trade(strategy.name, f"exit_{exit_type}", position.side, price,
+            if exit_type == "lock":
+                fee = calc_taker_fee(int(actual_exit), position.qty)
+            # Maker exits: correct the taker fee recorded by record_exit
+            if mode == "maker" and fee == 0.0:
+                strategy.total_fees -= closed.exit_fee
+                closed.exit_fee = 0.0
+                closed.net_pnl = closed.gross_pnl - closed.entry_fee - closed.exit_fee
+            print_status(f"[{self.label}][{strategy.name}] CLOSED [{mode}]: net={closed.net_pnl:.1f}c")
+            self._log_trade(strategy.name, f"exit_{exit_type}_{mode}", position.side, price,
                            actual_exit, position.qty, fee, reason, order_id)
             self._log_position(closed)
             return closed
@@ -1726,6 +1816,10 @@ class GameRunner:
 
             self.snapshots += 1
 
+            # Live config reload check
+            if self.snapshots % self._config_check_interval == 0:
+                self._check_config_reload()
+
             # Compute midpoint and spread for quality monitor
             yes_bid = prices.get("best_yes_bid")
             yes_ask = prices.get("imp_yes_ask")
@@ -1837,4 +1931,85 @@ class GameRunner:
             json.dump(result, f, indent=2, default=str)
         print_status(f"[{self.label}] Summary: {summary_path}")
 
+        # Verify fills against Kalshi
+        self._verify_fills()
+
         return result
+
+    def _check_config_reload(self):
+        """Hot-reload strategy params from strategy_config.json if modified."""
+        try:
+            if not self._config_path.exists():
+                return
+            mtime = self._config_path.stat().st_mtime
+            if mtime > self._last_config_mtime:
+                is_first_load = (self._last_config_mtime == 0.0)
+                new_cfg = json.loads(self._config_path.read_text(encoding="utf-8"))
+                for strategy in self.strategies:
+                    overrides = new_cfg.get(strategy.name, {})
+                    if overrides:
+                        strategy.update_params(overrides)
+                self._last_config_mtime = mtime
+                if not is_first_load:
+                    self._log_event("system", "config_reload", f"params updated from {self._config_path}")
+                    print_status(f"[{self.label}] Config reloaded from {self._config_path}")
+        except Exception as e:
+            self._log_event("system", "config_reload_error", str(e))
+
+    def _verify_fills(self):
+        """Compare our trades.csv against Kalshi's fill records."""
+        try:
+            if not self.trade_path.exists():
+                return
+
+            order_ids = set()
+            with open(self.trade_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    oid = row.get("order_id", "").strip()
+                    if oid:
+                        order_ids.add(oid)
+
+            if not order_ids:
+                self._log_event("system", "verify", "no orders to verify")
+                return
+
+            mismatches = 0
+            for oid in order_ids:
+                try:
+                    fills = fetch_fills_for_order(self.private_key, oid)
+                    if not fills:
+                        self._log_event("verify", "fill_mismatch", f"order_id={oid} no fills from Kalshi")
+                        mismatches += 1
+                        continue
+
+                    kalshi_qty = sum(int(f.get("count", 0)) for f in fills)
+                    # Compare with our logged qty for this order
+                    logged_qty = 0
+                    with open(self.trade_path, "r", encoding="utf-8") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            if row.get("order_id", "").strip() == oid:
+                                try:
+                                    logged_qty = int(row.get("qty", 0))
+                                except (ValueError, TypeError):
+                                    pass
+                                break
+
+                    if kalshi_qty != logged_qty:
+                        self._log_event("verify", "fill_mismatch",
+                                       f"order_id={oid} logged_qty={logged_qty} kalshi_qty={kalshi_qty}")
+                        mismatches += 1
+
+                except Exception as e:
+                    self._log_event("verify", "fill_check_error", f"order_id={oid} {e}")
+
+            if mismatches == 0:
+                self._log_event("system", "verify", f"fills_ok: {len(order_ids)} orders verified")
+            else:
+                self._log_event("system", "verify", f"{mismatches} mismatches out of {len(order_ids)} orders")
+
+            print_status(f"[{self.label}] Verification: {len(order_ids)} orders, {mismatches} mismatches")
+
+        except Exception as e:
+            self._log_event("system", "verify_error", str(e))

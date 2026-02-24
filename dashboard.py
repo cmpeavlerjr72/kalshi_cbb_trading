@@ -942,7 +942,10 @@ def build_dashboard_data(date_str: str):
         result["ml_vs_spread"]["spread_risked"] += sp_risked
         # Skip games with no meaningful data (empty CSVs / failed runs)
         has_snapshots = any(t.get("mid", 0) != 0 for t in game_data["tickers"])
-        has_trades = any(t.get("realized", 0) != 0 or t.get("open_count", 0) > 0 for t in game_data["tickers"])
+        has_trades = any(
+            t.get("realized", 0) != 0 or t.get("open_count", 0) > 0 or t.get("capital_risked", 0) > 0
+            for t in game_data["tickers"]
+        )
         has_charts = any(t.get("chart", {}).get("mid_series") for t in game_data["tickers"])
         if has_snapshots or has_trades or has_charts:
             result["games"].append(game_data)
