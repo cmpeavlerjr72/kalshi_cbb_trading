@@ -111,18 +111,27 @@ _cache = R2Cache(ttl_secs=15)
 # ESPN SCORE FETCHING
 # =============================================================================
 
-_espn_bg_lock = threading.Lock()
-_espn_bg_pending = set()  # dates currently being fetched in background
+# Separate longer-lived cache for ESPN scores (survives across 20s dashboard refreshes)
+_espn_cache = R2Cache(ttl_secs=30)
 
 
-def _fetch_all_scores_sync(espn_date):
-    """Blocking ESPN fetch — called from background thread."""
+def _fetch_espn_scores(espn_date):
+    """
+    Fetch ESPN scoreboard for a date, return {TEAM_ABBR: score_info}.
+    Cached for 30s. Blocking but fast (3s timeout).
+    """
+    cache_key = f"espn_{espn_date}"
+    cached = _espn_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         url = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
         resp = _requests.get(url, params={"dates": espn_date, "groups": "50", "limit": "500"},
-                             timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+                             timeout=3, headers={"User-Agent": "Mozilla/5.0"})
         data = resp.json()
-    except Exception:
+    except Exception as e:
+        print(f"[dashboard] ESPN fetch error for {espn_date}: {e}")
         return {}
 
     scores = {}
@@ -171,30 +180,9 @@ def _fetch_all_scores_sync(espn_date):
         for abbr in teams:
             scores[abbr] = info
 
-    cache_key = f"__espn_scores__{espn_date}"
-    _cache.put(cache_key, scores)
-    with _espn_bg_lock:
-        _espn_bg_pending.discard(espn_date)
+    print(f"[dashboard] ESPN fetched {len(scores)} team entries for {espn_date}")
+    _espn_cache.put(cache_key, scores)
     return scores
-
-
-def _fetch_all_scores(espn_date):
-    """
-    Non-blocking ESPN fetch. Returns cached scores immediately if available,
-    otherwise kicks off a background thread and returns {} (scores appear next refresh).
-    """
-    cache_key = f"__espn_scores__{espn_date}"
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    # Kick off background fetch if not already running
-    with _espn_bg_lock:
-        if espn_date not in _espn_bg_pending:
-            _espn_bg_pending.add(espn_date)
-            threading.Thread(target=_fetch_all_scores_sync, args=(espn_date,), daemon=True).start()
-
-    return {}
 
 
 def _get_game_score(game_key):
@@ -204,14 +192,16 @@ def _get_game_score(game_key):
     """
     cfg = ESPN_LOOKUP.get(game_key)
     if not cfg:
+        print(f"[dashboard] No ESPN_LOOKUP entry for game_key={game_key!r}  (keys: {list(ESPN_LOOKUP.keys())[:3]}...)")
         return {}
 
-    all_scores = _fetch_all_scores(cfg["espn_date"])
+    all_scores = _fetch_espn_scores(cfg["espn_date"])
     if not all_scores:
         return {}
 
     info = all_scores.get(cfg["espn_team"])
     if not info:
+        print(f"[dashboard] ESPN team {cfg['espn_team']!r} not found in scoreboard (available: {list(all_scores.keys())[:10]}...)")
         return {}
 
     teams = info["teams"]
