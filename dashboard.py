@@ -760,13 +760,16 @@ def build_dashboard_data(date_str: str):
         }
 
         # ESPN live scores
-        score_info = _get_game_score(game_key)
-        if score_info:
-            game_data["team_score"] = score_info.get("team_score")
-            game_data["opp_score"] = score_info.get("opp_score")
-            game_data["score_display"] = score_info.get("score_display", "")
-            game_data["clock_display"] = score_info.get("clock_display", "")
-            game_data["game_state"] = score_info.get("game_state", "")
+        try:
+            score_info = _get_game_score(game_key)
+            if score_info:
+                game_data["team_score"] = score_info.get("team_score")
+                game_data["opp_score"] = score_info.get("opp_score")
+                game_data["score_display"] = score_info.get("score_display", "")
+                game_data["clock_display"] = score_info.get("clock_display", "")
+                game_data["game_state"] = score_info.get("game_state", "")
+        except Exception as e:
+            print(f"[dashboard] ESPN score fetch error for {game_key}: {e}")
 
         all_open_positions = []
         all_closed_stats = []
@@ -847,7 +850,10 @@ def build_dashboard_data(date_str: str):
             trade_markers = build_trade_markers(trades, positions)
 
             # MR signal proximity
-            mr_signal = compute_mr_signal(snapshots)
+            try:
+                mr_signal = compute_mr_signal(snapshots)
+            except Exception:
+                mr_signal = None
 
             ticker_data = {
                 "label": ticker_label,
@@ -979,6 +985,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.end_headers()
         except BrokenPipeError:
             pass
+        except Exception as e:
+            print(f"[dashboard] do_GET error on {self.path}: {e}")
+            import traceback; traceback.print_exc()
+            try:
+                self._send_json({"error": str(e)}, status=500)
+            except Exception:
+                pass
 
 
 # =============================================================================
