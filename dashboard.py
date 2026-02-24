@@ -555,7 +555,7 @@ def compute_open_positions(trades):
         side = t.get("side", "")
         key = (strategy, side)
 
-        if action == "entry_fill":
+        if action.startswith("entry_fill"):
             if key not in queues:
                 queues[key] = []
             queues[key].append({
@@ -712,7 +712,7 @@ def build_trade_markers(trades, positions_rows):
     markers = []
     for t in trades:
         action = t.get("action", "")
-        if action == "entry_fill":
+        if action.startswith("entry_fill"):
             markers.append({
                 "type": "entry",
                 "time": t.get("timestamp", ""),
@@ -1038,6 +1038,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
 
