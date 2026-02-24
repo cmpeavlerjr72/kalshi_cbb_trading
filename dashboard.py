@@ -309,11 +309,12 @@ def compute_mr_signal(snapshots, sport="cbb"):
     }
 
 
-def compute_mr_series(snapshots, sport="cbb"):
+def compute_mr_series(snapshots, sport="cbb", trade_markers=None):
     """
     Walk all valid snapshots and compute rolling MR bands at each point.
     Uses sport-specific params matching the live strategy.
-    Returns a downsampled list of {time, mid, mean, upper, lower} dicts (~120 pts).
+    Returns list of {time, mid, mean, upper, lower} dicts.
+    Downsamples to ~500 points but always preserves snapshots near trade times.
     """
     # Sport-specific params matching production_strategies.py / tennis_runner.py
     if sport == "tennis":
@@ -365,17 +366,43 @@ def compute_mr_series(snapshots, sport="cbb"):
             "lower": round(lower, 2),
         })
 
-    # Downsample to ~120 display points
-    if len(full) > 120:
-        step = len(full) / 120
-        sampled = []
-        for j in range(120):
-            sampled.append(full[int(j * step)])
-        # Always include the last point
-        if sampled[-1] is not full[-1]:
-            sampled[-1] = full[-1]
-        return sampled
-    return full
+    TARGET = 500
+    if len(full) <= TARGET:
+        return full
+
+    # Build set of indices that MUST be kept (near trade times)
+    keep = set()
+    if trade_markers:
+        from datetime import datetime as _dt
+        full_times = []
+        for f in full:
+            try:
+                full_times.append(_dt.fromisoformat(f["time"].replace("Z", "+00:00")).timestamp())
+            except Exception:
+                full_times.append(0)
+
+        for m in trade_markers:
+            try:
+                mt = _dt.fromisoformat(m["time"].replace("Z", "+00:00")).timestamp()
+            except Exception:
+                continue
+            # Find closest index and keep a window around it
+            best_i = min(range(len(full_times)), key=lambda i: abs(full_times[i] - mt))
+            for offset in range(-5, 6):
+                idx = best_i + offset
+                if 0 <= idx < len(full):
+                    keep.add(idx)
+
+    # Uniform downsample, then merge in kept indices
+    step = len(full) / TARGET
+    sampled_indices = set()
+    for j in range(TARGET):
+        sampled_indices.add(int(j * step))
+    sampled_indices.add(len(full) - 1)  # always include last
+    sampled_indices |= keep
+
+    result = [full[i] for i in sorted(sampled_indices)]
+    return result
 
 
 # =============================================================================
@@ -786,7 +813,8 @@ def ticker_type(ticker_label: str) -> str:
     return "ML"
 
 
-def build_chart_data(snapshots, positions_rows, ticker_label, sport="cbb"):
+def build_chart_data(snapshots, positions_rows, ticker_label, sport="cbb",
+                     trade_markers=None):
     """
     Build chart series for one ticker.
     - mid_series: downsampled mid values from snapshots.csv (~60 points)
@@ -818,7 +846,7 @@ def build_chart_data(snapshots, positions_rows, ticker_label, sport="cbb"):
         })
 
     # MR band series
-    mr_series = compute_mr_series(snapshots, sport=sport)
+    mr_series = compute_mr_series(snapshots, sport=sport, trade_markers=trade_markers)
 
     return {"mid_series": mid_series, "pnl_series": pnl_series, "mr_series": mr_series}
 
@@ -1035,8 +1063,9 @@ def build_dashboard_data(date_str: str):
             spread = safe_float(latest_snap.get("spread")) if latest_snap else 0
 
             # Charts
-            chart_data = build_chart_data(snapshots, positions, ticker_label, sport=game_sport)
             trade_markers = build_trade_markers(trades, positions)
+            chart_data = build_chart_data(snapshots, positions, ticker_label,
+                                          sport=game_sport, trade_markers=trade_markers)
             order_activity = compute_order_activity(trades, events)
 
             # MR signal proximity
