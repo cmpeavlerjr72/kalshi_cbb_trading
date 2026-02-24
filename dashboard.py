@@ -1459,20 +1459,25 @@ function renderCharts(data) {
     else spTickerSeries.push(pts);
   });
 
-  // Build a proper cumulative line across multiple tickers:
-  // At each trade event, sum every ticker's latest cum_pnl (carry forward between trades)
+  // Build a step-style cumulative line: starts at 0, flat between trades, steps on each event
+  const nowMinutes = (Date.now() - refTime) / 60000;
   function buildCumLine(groups) {
     let events = [];
     groups.forEach((pts, idx) => { pts.forEach(p => events.push({x:p.x, idx:idx, cum:p.cum})); });
     if (events.length === 0) return [];
     events.sort((a,b) => a.x - b.x);
     let last = new Array(groups.length).fill(0);
-    let out = [];
+    let out = [{x:0, y:0}];  // start at origin
     events.forEach(e => {
+      let prevSum = 0; for (let i=0;i<last.length;i++) prevSum += last[i];
+      out.push({x:e.x, y:prevSum});  // flat step to just before this event
       last[e.idx] = e.cum;
-      let sum = 0; for (let i=0;i<last.length;i++) sum += last[i];
-      out.push({x:e.x, y:sum});
+      let newSum = 0; for (let i=0;i<last.length;i++) newSum += last[i];
+      out.push({x:e.x, y:newSum});   // jump to new value
     });
+    // extend flat to current time
+    let finalSum = 0; for (let i=0;i<last.length;i++) finalSum += last[i];
+    out.push({x:nowMinutes, y:finalSum});
     return out;
   }
 
