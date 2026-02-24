@@ -726,33 +726,57 @@ def build_chart_data(snapshots, positions_rows, ticker_label):
     return {"mid_series": mid_series, "pnl_series": pnl_series}
 
 
-def compute_order_activity(trades):
+def compute_order_activity(trades, events):
     """
-    Summarize order attempts from trades.csv.
-    Returns dict with counts and the last order attempt info.
+    Summarize order activity from trades.csv + events.csv.
+    Events has entry_attempt_*, entry_skip_* (orders that never hit exchange).
+    Trades has entry_fill_*, entry_nofill_* (orders that were placed).
     """
     attempts = 0
     fills = 0
     nofills = 0
     skips = 0
-    last_attempt = None
+    last_event = None
 
+    # Count attempts and skips from events.csv
+    for e in events:
+        ev = e.get("event", "")
+        if ev.startswith("entry_attempt"):
+            attempts += 1
+            detail = e.get("detail", "")
+            # Parse "yes 3x@38c mr_deviation" → side, price
+            parts = detail.split()
+            side = parts[0] if parts else ""
+            price = ""
+            if len(parts) > 1 and "@" in parts[1]:
+                price = parts[1].split("@")[1].rstrip("c")
+            last_event = {"action": "attempt", "side": side, "price": price, "time": e.get("timestamp", "")}
+        elif ev.startswith("entry_skip"):
+            skips += 1
+            detail = e.get("detail", "")
+            parts = detail.split("@")
+            side = parts[0].strip() if parts else ""
+            price = parts[1].split("c")[0] if len(parts) > 1 else ""
+            # Friendly skip reason
+            reason = ev.replace("entry_skip_", "").replace("_", " ")
+            last_event = {"action": "skip", "side": side, "price": price, "time": e.get("timestamp", ""), "reason": reason}
+
+    # Count fills and nofills from trades.csv
     for t in trades:
         action = t.get("action", "")
         if "entry_fill" in action:
-            attempts += 1
             fills += 1
-            last_attempt = {"action": "fill", "side": t.get("side", ""), "price": t.get("intended_price", ""), "time": t.get("timestamp", "")}
+            last_event = {"action": "fill", "side": t.get("side", ""), "price": t.get("intended_price", ""), "time": t.get("timestamp", "")}
         elif "entry_nofill" in action:
-            attempts += 1
             nofills += 1
-            last_attempt = {"action": "nofill", "side": t.get("side", ""), "price": t.get("intended_price", ""), "time": t.get("timestamp", "")}
+            last_event = {"action": "nofill", "side": t.get("side", ""), "price": t.get("intended_price", ""), "time": t.get("timestamp", "")}
 
     return {
         "attempts": attempts,
         "fills": fills,
         "nofills": nofills,
-        "last": last_attempt,
+        "skips": skips,
+        "last": last_event,
     }
 
 
@@ -915,7 +939,7 @@ def build_dashboard_data(date_str: str):
             # Charts
             chart_data = build_chart_data(snapshots, positions, ticker_label)
             trade_markers = build_trade_markers(trades, positions)
-            order_activity = compute_order_activity(trades)
+            order_activity = compute_order_activity(trades, events)
 
             # MR signal proximity
             try:
@@ -1335,18 +1359,21 @@ function fmtAge(secs) {
 
 function fmtOrders(ord) {
   if (!ord || ord.attempts === 0) return '<span style="color:var(--text2)">--</span>';
-  const f = ord.fills, nf = ord.nofills;
+  const f = ord.fills, nf = ord.nofills, sk = ord.skips||0;
   let parts = [];
   if (f > 0) parts.push('<span style="color:var(--green)">'+f+' fill'+(f>1?'s':'')+'</span>');
   if (nf > 0) parts.push('<span style="color:var(--orange)">'+nf+' nofill'+(nf>1?'s':'')+'</span>');
+  if (sk > 0) parts.push('<span style="color:var(--text2)">'+sk+' skip'+(sk>1?'s':'')+'</span>');
   let html = parts.join(' / ');
   if (ord.last) {
     const ago = ord.last.time ? fmtTime(ord.last.time) : '';
     const side = (ord.last.side||'').toUpperCase();
     const sideColor = ord.last.side === 'yes' ? 'var(--green)' : 'var(--red)';
-    const icon = ord.last.action === 'fill' ? '&#10003;' : '&#10007;';
-    const iconColor = ord.last.action === 'fill' ? 'var(--green)' : 'var(--orange)';
-    html += '<br><span style="font-size:10px;color:var(--text2)">Last: <span style="color:'+iconColor+'">'+icon+'</span> <span style="color:'+sideColor+'">'+side+'</span> @'+ord.last.price+'c '+ago+'</span>';
+    const icons = {fill:'&#10003;', nofill:'&#10007;', skip:'&#8856;', attempt:'&#9654;'};
+    const colors = {fill:'var(--green)', nofill:'var(--orange)', skip:'var(--text2)', attempt:'var(--blue)'};
+    const act = ord.last.action||'attempt';
+    const reason = ord.last.reason ? ' ('+ord.last.reason+')' : '';
+    html += '<br><span style="font-size:10px;color:var(--text2)">Last: <span style="color:'+(colors[act]||'var(--text2)')+'">'+( icons[act]||'?')+'</span> <span style="color:'+sideColor+'">'+side+'</span>'+(ord.last.price ? ' @'+ord.last.price+'c' : '')+reason+' '+ago+'</span>';
   }
   return html;
 }
