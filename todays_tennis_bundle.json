@@ -1,0 +1,264 @@
+{
+  "meta": {
+    "env": "PROD",
+    "base_url": "https://api.elections.kalshi.com",
+    "date_token": "26FEB24",
+    "sport": "tennis",
+    "series": "KXATPMATCH",
+    "created_utc": "2026-02-24T21:22:13.296814Z"
+  },
+  "matches": {
+    "26FEB24HIJBEL": {
+      "match_key": "26FEB24HIJBEL",
+      "date_token": "26FEB24",
+      "player1": "Hijikata",
+      "player2": "Bellucci",
+      "round": "Round Of 32",
+      "matchup": "Hijikata vs Bellucci",
+      "tickers": {
+        "ml": [
+          "KXATPMATCH-26FEB24HIJBEL-BEL",
+          "KXATPMATCH-26FEB24HIJBEL-HIJ"
+        ]
+      },
+      "ml_outcomes": {
+        "HIJ": "KXATPMATCH-26FEB24HIJBEL-HIJ",
+        "BEL": "KXATPMATCH-26FEB24HIJBEL-BEL"
+      },
+      "markets": [
+        {
+          "ticker": "KXATPMATCH-26FEB24HIJBEL-HIJ",
+          "event_ticker": "KXATPMATCH-26FEB24HIJBEL",
+          "title": "Will Rinky Hijikata win the Hijikata vs Bellucci : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        },
+        {
+          "ticker": "KXATPMATCH-26FEB24HIJBEL-BEL",
+          "event_ticker": "KXATPMATCH-26FEB24HIJBEL",
+          "title": "Will Mattia Bellucci win the Hijikata vs Bellucci : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        }
+      ],
+      "close_time": "2026-03-11T00:00:00Z",
+      "search_text": "Hijikata Bellucci Hijikata vs Bellucci 26FEB24HIJBEL KXATPMATCH-26FEB24HIJBEL-BEL KXATPMATCH-26FEB24HIJBEL-HIJ"
+    },
+    "26FEB24MANSHI": {
+      "match_key": "26FEB24MANSHI",
+      "date_token": "26FEB24",
+      "player1": "Mannarino",
+      "player2": "Shimabukuro",
+      "round": "Round Of 32",
+      "matchup": "Mannarino vs Shimabukuro",
+      "tickers": {
+        "ml": [
+          "KXATPMATCH-26FEB24MANSHI-MAN",
+          "KXATPMATCH-26FEB24MANSHI-SHI"
+        ]
+      },
+      "ml_outcomes": {
+        "SHI": "KXATPMATCH-26FEB24MANSHI-SHI",
+        "MAN": "KXATPMATCH-26FEB24MANSHI-MAN"
+      },
+      "markets": [
+        {
+          "ticker": "KXATPMATCH-26FEB24MANSHI-SHI",
+          "event_ticker": "KXATPMATCH-26FEB24MANSHI",
+          "title": "Will Sho Shimabukuro win the Mannarino vs Shimabukuro : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        },
+        {
+          "ticker": "KXATPMATCH-26FEB24MANSHI-MAN",
+          "event_ticker": "KXATPMATCH-26FEB24MANSHI",
+          "title": "Will Adrian Mannarino win the Mannarino vs Shimabukuro : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        }
+      ],
+      "close_time": "2026-03-11T00:00:00Z",
+      "search_text": "Mannarino Shimabukuro Mannarino vs Shimabukuro 26FEB24MANSHI KXATPMATCH-26FEB24MANSHI-MAN KXATPMATCH-26FEB24MANSHI-SHI"
+    },
+    "26FEB24YUASRA": {
+      "match_key": "26FEB24YUASRA",
+      "date_token": "26FEB24",
+      "player1": "Yuan",
+      "player2": "Sramkova",
+      "round": "Round Of 32",
+      "matchup": "Yuan vs Sramkova",
+      "tickers": {
+        "ml": [
+          "KXWTAMATCH-26FEB24YUASRA-YUA",
+          "KXWTAMATCH-26FEB24YUASRA-SRA"
+        ]
+      },
+      "ml_outcomes": {
+        "YUA": "KXWTAMATCH-26FEB24YUASRA-YUA",
+        "SRA": "KXWTAMATCH-26FEB24YUASRA-SRA"
+      },
+      "markets": [
+        {
+          "ticker": "KXWTAMATCH-26FEB24YUASRA-YUA",
+          "event_ticker": "KXWTAMATCH-26FEB24YUASRA",
+          "title": "Will Yue Yuan win the Yuan vs Sramkova : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        },
+        {
+          "ticker": "KXWTAMATCH-26FEB24YUASRA-SRA",
+          "event_ticker": "KXWTAMATCH-26FEB24YUASRA",
+          "title": "Will Rebecca Sramkova win the Yuan vs Sramkova : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        }
+      ],
+      "close_time": "2026-03-11T00:00:00Z",
+      "search_text": "Yuan Sramkova Yuan vs Sramkova 26FEB24YUASRA KXWTAMATCH-26FEB24YUASRA-YUA KXWTAMATCH-26FEB24YUASRA-SRA"
+    },
+    "26FEB24FRETIM": {
+      "match_key": "26FEB24FRETIM",
+      "date_token": "26FEB24",
+      "player1": "Frech",
+      "player2": "Timofeeva",
+      "round": "Round Of 32",
+      "matchup": "Frech vs Timofeeva",
+      "tickers": {
+        "ml": [
+          "KXWTAMATCH-26FEB24FRETIM-FRE",
+          "KXWTAMATCH-26FEB24FRETIM-TIM"
+        ]
+      },
+      "ml_outcomes": {
+        "FRE": "KXWTAMATCH-26FEB24FRETIM-FRE",
+        "TIM": "KXWTAMATCH-26FEB24FRETIM-TIM"
+      },
+      "markets": [
+        {
+          "ticker": "KXWTAMATCH-26FEB24FRETIM-FRE",
+          "event_ticker": "KXWTAMATCH-26FEB24FRETIM",
+          "title": "Will Magdalena Frech win the Frech vs Timofeeva : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        },
+        {
+          "ticker": "KXWTAMATCH-26FEB24FRETIM-TIM",
+          "event_ticker": "KXWTAMATCH-26FEB24FRETIM",
+          "title": "Will Maria Timofeeva win the Frech vs Timofeeva : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        }
+      ],
+      "close_time": "2026-03-11T00:00:00Z",
+      "search_text": "Frech Timofeeva Frech vs Timofeeva 26FEB24FRETIM KXWTAMATCH-26FEB24FRETIM-FRE KXWTAMATCH-26FEB24FRETIM-TIM"
+    },
+    "26FEB22DUCSVR": {
+      "match_key": "26FEB22DUCSVR",
+      "date_token": "26FEB22",
+      "player1": "Duckworth",
+      "player2": "Svrcina",
+      "round": "Round Of 32",
+      "matchup": "Duckworth vs Svrcina",
+      "tickers": {
+        "ml": [
+          "KXATPMATCH-26FEB22DUCSVR-DUC",
+          "KXATPMATCH-26FEB22DUCSVR-SVR"
+        ]
+      },
+      "ml_outcomes": {
+        "DUC": "KXATPMATCH-26FEB22DUCSVR-DUC",
+        "SVR": "KXATPMATCH-26FEB22DUCSVR-SVR"
+      },
+      "markets": [
+        {
+          "ticker": "KXATPMATCH-26FEB22DUCSVR-DUC",
+          "event_ticker": "KXATPMATCH-26FEB22DUCSVR",
+          "title": "Will James Duckworth win the Duckworth vs Svrcina : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        },
+        {
+          "ticker": "KXATPMATCH-26FEB22DUCSVR-SVR",
+          "event_ticker": "KXATPMATCH-26FEB22DUCSVR",
+          "title": "Will Dalibor Svrcina win the Duckworth vs Svrcina : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        }
+      ],
+      "close_time": "2026-03-11T00:00:00Z",
+      "search_text": "Duckworth Svrcina Duckworth vs Svrcina 26FEB22DUCSVR KXATPMATCH-26FEB22DUCSVR-DUC KXATPMATCH-26FEB22DUCSVR-SVR"
+    },
+    "26FEB24RUUYIB": {
+      "match_key": "26FEB24RUUYIB",
+      "date_token": "26FEB24",
+      "player1": "Ruud",
+      "player2": "Wu",
+      "round": "Round Of 32",
+      "matchup": "Ruud vs Wu",
+      "tickers": {
+        "ml": [
+          "KXATPMATCH-26FEB24RUUYIB-RUU",
+          "KXATPMATCH-26FEB24RUUYIB-YIB"
+        ]
+      },
+      "ml_outcomes": {
+        "YIB": "KXATPMATCH-26FEB24RUUYIB-YIB",
+        "RUU": "KXATPMATCH-26FEB24RUUYIB-RUU"
+      },
+      "markets": [
+        {
+          "ticker": "KXATPMATCH-26FEB24RUUYIB-YIB",
+          "event_ticker": "KXATPMATCH-26FEB24RUUYIB",
+          "title": "Will Yibing Wu win the Ruud vs Wu : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        },
+        {
+          "ticker": "KXATPMATCH-26FEB24RUUYIB-RUU",
+          "event_ticker": "KXATPMATCH-26FEB24RUUYIB",
+          "title": "Will Casper Ruud win the Ruud vs Wu : Round Of 32 match?",
+          "status": "active",
+          "close_time": "2026-03-11T00:00:00Z"
+        }
+      ],
+      "close_time": "2026-03-11T00:00:00Z",
+      "search_text": "Ruud Wu Ruud vs Wu 26FEB24RUUYIB KXATPMATCH-26FEB24RUUYIB-RUU KXATPMATCH-26FEB24RUUYIB-YIB"
+    },
+    "26FEB24UGOHAN": {
+      "match_key": "26FEB24UGOHAN",
+      "date_token": "26FEB24",
+      "player1": "Ugo Carabelli",
+      "player2": "Hanfmann",
+      "round": "Round Of 16",
+      "matchup": "Ugo Carabelli vs Hanfmann",
+      "tickers": {
+        "ml": [
+          "KXATPMATCH-26FEB24UGOHAN-HAN",
+          "KXATPMATCH-26FEB24UGOHAN-UGO"
+        ]
+      },
+      "ml_outcomes": {
+        "UGO": "KXATPMATCH-26FEB24UGOHAN-UGO",
+        "HAN": "KXATPMATCH-26FEB24UGOHAN-HAN"
+      },
+      "markets": [
+        {
+          "ticker": "KXATPMATCH-26FEB24UGOHAN-UGO",
+          "event_ticker": "KXATPMATCH-26FEB24UGOHAN",
+          "title": "Will Camilo Ugo Carabelli win the Ugo Carabelli vs Hanfmann : Round Of 16 match?",
+          "status": "active",
+          "close_time": "2026-03-10T16:00:00Z"
+        },
+        {
+          "ticker": "KXATPMATCH-26FEB24UGOHAN-HAN",
+          "event_ticker": "KXATPMATCH-26FEB24UGOHAN",
+          "title": "Will Yannick Hanfmann win the Ugo Carabelli vs Hanfmann : Round Of 16 match?",
+          "status": "active",
+          "close_time": "2026-03-10T16:00:00Z"
+        }
+      ],
+      "close_time": "2026-03-10T16:00:00Z",
+      "search_text": "Ugo Carabelli Hanfmann Ugo Carabelli vs Hanfmann 26FEB24UGOHAN KXATPMATCH-26FEB24UGOHAN-HAN KXATPMATCH-26FEB24UGOHAN-UGO"
+    }
+  }
+}

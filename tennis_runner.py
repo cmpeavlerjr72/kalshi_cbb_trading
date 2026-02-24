@@ -57,7 +57,7 @@ import re
 # CONFIGURATION
 # ============================================================================
 
-TENNIS_SERIES = ["KXATPMATCH", "KXATPCHALLENGERMATCH"]
+TENNIS_SERIES = ["KXATPMATCH", "KXATPCHALLENGERMATCH", "KXWTAMATCH"]
 
 # Today's matches — edit before running
 # player_code must match the Kalshi ticker suffix (e.g. "POP", "RUB", "MEN")
@@ -70,25 +70,26 @@ MATCHES = [
         "model_p_win": 0.50,
     },
     {
-        "label": "Cerundolo vs Garin",
-        "player_code": "CER",
-        "opponent_code": "GAR",
-        "match_key": "26FEB22CERGAR",
+        "label": "Yuan vs Sramkova",
+        "player_code": "YUA",
+        "opponent_code": "SRA",
+        "match_key": "26FEB24YUASRA",
+        "series": "KXWTAMATCH",
         "model_p_win": 0.50,
     },
     {
-        "label": "Passaro vs Vallejo",
-        "player_code": "PAS",
-        "opponent_code": "VAL",
-        "match_key": "26FEB24PASVAL",
+        "label": "Frech vs Timofeeva",
+        "player_code": "FRE",
+        "opponent_code": "TIM",
+        "match_key": "26FEB24FRETIM",
+        "series": "KXWTAMATCH",
         "model_p_win": 0.50,
     },
     {
-        "label": "La Serna vs Aboian",
-        "player_code": "LA",
-        "opponent_code": "ABO",
-        "match_key": "26FEB24LAABO",
-        "series": "KXATPCHALLENGERMATCH",
+        "label": "Duckworth vs Svrcina",
+        "player_code": "DUC",
+        "opponent_code": "SVR",
+        "match_key": "26FEB22DUCSVR",
         "model_p_win": 0.50,
     },
 ]
@@ -106,12 +107,18 @@ def safe_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_\-]", "", s)
 
 
-def build_match_log_dir(match_label: str, match_date: str) -> Path:
+def build_match_log_dir(match_label: str, match_date: str,
+                        series: str = "atp") -> Path:
+    # Derive subfolder from series: KXWTAMATCH → wta, KXATPMATCH → atp
+    if "WTA" in series.upper():
+        subfolder = "wta"
+    else:
+        subfolder = "atp"
     return (
         LOG_ROOT
         / "kalshi"
         / "tennis"
-        / "atp"
+        / subfolder
         / match_date
         / safe_name(match_label)
     )
@@ -229,9 +236,10 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
         # Shared exposure tracker for this match
         exposure = ExposureTracker(max_exposure_dollars=allocation)
 
-        # Log directory
+        # Log directory — derive series from ticker for correct subfolder
         match_date = utc_now().strftime("%Y-%m-%d")
-        log_dir = build_match_log_dir(label, match_date)
+        ticker_series = ml_ticker.split("-")[0] if ml_ticker else (series_override or "KXATPMATCH")
+        log_dir = build_match_log_dir(label, match_date, series=ticker_series)
         log_dir.mkdir(parents=True, exist_ok=True)
 
         # Load strategy config overrides

@@ -275,8 +275,22 @@ class BaseStrategy(ABC):
         return True, "ok"
 
     def update_params(self, overrides: dict):
-        """Hot-reload: merge new param values into existing params."""
+        """Hot-reload: merge new param values and rebuild dependent state."""
         self.params.update(overrides)
+
+        # Rebuild cached scalars from params
+        if "min_entry_gap_secs" in overrides:
+            self.min_entry_gap_secs = overrides["min_entry_gap_secs"]
+        if "side_cooldown_secs" in overrides:
+            self._side_cooldown_secs = overrides["side_cooldown_secs"]
+
+        # Rebuild deques with correct maxlen (preserving existing data)
+        if "lookback" in overrides and hasattr(self, "prices"):
+            old = list(self.prices)
+            self.prices = deque(old, maxlen=self.params["lookback"])
+        if "long_lookback" in overrides and hasattr(self, "prices_long"):
+            old = list(self.prices_long)
+            self.prices_long = deque(old, maxlen=self.params["long_lookback"])
 
     def _side_on_cooldown(self, side: str) -> Tuple[bool, str]:
         """P1: Check if a side is on post-stop cooldown"""
