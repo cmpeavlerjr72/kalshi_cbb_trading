@@ -1081,12 +1081,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
 # =============================================================================
 
 def main():
+    global _bg_active_date
     port = int(os.getenv("PORT", os.getenv("DASHBOARD_PORT", "8050")))
+
+    # Seed poller with today's date so it starts fetching immediately
+    _bg_active_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Start background data poller
     poller = threading.Thread(target=_bg_poller, daemon=True)
     poller.start()
-    print("[dashboard] Background poller started")
+    print(f"[dashboard] Background poller started for {_bg_active_date}")
 
     server = HTTPServer(("0.0.0.0", port), DashboardHandler)
     print(f"Dashboard running on port {port}")
@@ -1640,15 +1644,14 @@ async function fetchDates() {
     (data.dates||[]).forEach((d,i) => {
       const opt = document.createElement('option');
       opt.value = d; opt.textContent = d;
-      if (i===0) opt.selected = true;
+      if (i===0) opt.selected = true;  // most recent date with R2 data
       sel.appendChild(opt);
     });
-    // Also add today if not present
+    // Add today as an option if not present, but don't auto-select
     const today = new Date().toISOString().slice(0,10);
     if (!data.dates.includes(today)) {
       const opt = document.createElement('option');
       opt.value = today; opt.textContent = today + ' (today)';
-      opt.selected = true;
       sel.prepend(opt);
     }
   } catch(e) { console.error('fetchDates error:', e); }
