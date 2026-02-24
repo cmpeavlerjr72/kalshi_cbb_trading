@@ -19,6 +19,7 @@ from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from datetime import datetime, timezone
 
+import re
 import requests as _requests
 
 from dotenv import load_dotenv
@@ -32,13 +33,19 @@ load_dotenv()
 GAMES_JSON = Path(__file__).parent / "games.json"
 
 
+def _safe_name(s: str) -> str:
+    """Must match tonight_runner_cloud.py safe_name() exactly."""
+    s = s.strip().replace(" ", "_")
+    return re.sub(r"[^A-Za-z0-9_\-]", "", s)
+
+
 def _load_espn_lookup():
-    """Map game labels (underscore form) to ESPN config."""
+    """Map game labels (safe_name form matching R2 folders) to ESPN config."""
     try:
         games = json.loads(GAMES_JSON.read_text())
         lookup = {}
         for g in games:
-            key = g["label"].replace(" ", "_")
+            key = _safe_name(g["label"])
             lookup[key] = {
                 "espn_date": g["espn_date"],
                 "espn_team": g["espn_team"].upper(),
