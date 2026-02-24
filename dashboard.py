@@ -249,11 +249,21 @@ def _get_game_score(game_key):
 # MR SIGNAL COMPUTATION
 # =============================================================================
 
-def compute_mr_signal(snapshots):
+def compute_mr_signal(snapshots, sport="cbb"):
     """
     Compute MR proximity from snapshot mid values.
-    Matches MR strategy: lookback=60, low_vol_std_mult=2.5 (std<5), high_vol_std_mult=1.5.
+    Uses sport-specific params matching the live strategy.
     """
+    # Sport-specific params
+    if sport == "tennis":
+        lookback = 80
+        low_vol_std_mult = 3.0
+        high_vol_std_mult = 2.0
+    else:
+        lookback = 120
+        low_vol_std_mult = 2.5
+        high_vol_std_mult = 1.5
+
     mids = []
     for s in snapshots:
         v = s.get("mid")
@@ -267,7 +277,7 @@ def compute_mr_signal(snapshots):
     if len(mids) < 10:
         return None
 
-    window = mids[-60:]  # last 60 samples (MR lookback)
+    window = mids[-lookback:]
     n = len(window)
     mean = sum(window) / n
     variance = sum((x - mean) ** 2 for x in window) / n
@@ -277,7 +287,7 @@ def compute_mr_signal(snapshots):
         return {"mr_mean": round(mean, 2), "mr_std": 0, "mr_threshold": 0,
                 "mr_deviation": 0, "mr_pct": 0, "status": "dead"}
 
-    std_mult = 2.5 if std < 5.0 else 1.5
+    std_mult = low_vol_std_mult if std < 5.0 else high_vol_std_mult
     threshold = std_mult * std
     deviation = mids[-1] - mean
 
@@ -299,11 +309,23 @@ def compute_mr_signal(snapshots):
     }
 
 
-def compute_mr_series(snapshots, lookback=120):
+def compute_mr_series(snapshots, sport="cbb"):
     """
     Walk all valid snapshots and compute rolling MR bands at each point.
+    Uses sport-specific params matching the live strategy.
     Returns a downsampled list of {time, mid, mean, upper, lower} dicts (~120 pts).
     """
+    # Sport-specific params matching production_strategies.py / tennis_runner.py
+    if sport == "tennis":
+        lookback = 80
+        low_vol_std_mult = 3.0
+        high_vol_std_mult = 2.0
+    else:
+        lookback = 120
+        low_vol_std_mult = 2.5
+        high_vol_std_mult = 1.5
+    low_vol_cutoff = 5.0
+
     # Extract (time, mid) pairs
     points = []
     for s in snapshots:
@@ -332,7 +354,7 @@ def compute_mr_series(snapshots, lookback=120):
         std = variance ** 0.5
         if std < 0.1:
             continue
-        std_mult = 2.5 if std < 5.0 else 1.5
+        std_mult = low_vol_std_mult if std < low_vol_cutoff else high_vol_std_mult
         upper = mean + std_mult * std
         lower = mean - std_mult * std
         full.append({
@@ -764,11 +786,12 @@ def ticker_type(ticker_label: str) -> str:
     return "ML"
 
 
-def build_chart_data(snapshots, positions_rows, ticker_label):
+def build_chart_data(snapshots, positions_rows, ticker_label, sport="cbb"):
     """
     Build chart series for one ticker.
     - mid_series: downsampled mid values from snapshots.csv (~60 points)
     - pnl_series: cumulative P&L from positions.csv (one point per closed trade)
+    - mr_series: rolling MR bands with sport-specific params
     """
     # Mid price series (downsample to ~60 points)
     mid_series = []
@@ -795,7 +818,7 @@ def build_chart_data(snapshots, positions_rows, ticker_label):
         })
 
     # MR band series
-    mr_series = compute_mr_series(snapshots)
+    mr_series = compute_mr_series(snapshots, sport=sport)
 
     return {"mid_series": mid_series, "pnl_series": pnl_series, "mr_series": mr_series}
 
@@ -1012,13 +1035,13 @@ def build_dashboard_data(date_str: str):
             spread = safe_float(latest_snap.get("spread")) if latest_snap else 0
 
             # Charts
-            chart_data = build_chart_data(snapshots, positions, ticker_label)
+            chart_data = build_chart_data(snapshots, positions, ticker_label, sport=game_sport)
             trade_markers = build_trade_markers(trades, positions)
             order_activity = compute_order_activity(trades, events)
 
             # MR signal proximity
             try:
-                mr_signal = compute_mr_signal(snapshots)
+                mr_signal = compute_mr_signal(snapshots, sport=game_sport)
             except Exception:
                 mr_signal = None
 
