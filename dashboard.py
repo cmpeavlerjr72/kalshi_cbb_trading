@@ -299,6 +299,63 @@ def compute_mr_signal(snapshots):
     }
 
 
+def compute_mr_series(snapshots, lookback=120):
+    """
+    Walk all valid snapshots and compute rolling MR bands at each point.
+    Returns a downsampled list of {time, mid, mean, upper, lower} dicts (~120 pts).
+    """
+    # Extract (time, mid) pairs
+    points = []
+    for s in snapshots:
+        v = s.get("mid")
+        if not v:
+            continue
+        try:
+            mid = float(v)
+        except (ValueError, TypeError):
+            continue
+        points.append((s.get("timestamp", ""), mid))
+
+    if len(points) < lookback:
+        return []
+
+    # Compute rolling stats at every point
+    mids = [p[1] for p in points]
+    full = []
+    for i in range(len(points)):
+        window = mids[max(0, i - lookback + 1):i + 1]
+        if len(window) < lookback:
+            continue  # skip warmup
+        n = len(window)
+        mean = sum(window) / n
+        variance = sum((x - mean) ** 2 for x in window) / n
+        std = variance ** 0.5
+        if std < 0.1:
+            continue
+        std_mult = 2.5 if std < 5.0 else 1.5
+        upper = mean + std_mult * std
+        lower = mean - std_mult * std
+        full.append({
+            "time": points[i][0],
+            "mid": round(mids[i], 2),
+            "mean": round(mean, 2),
+            "upper": round(upper, 2),
+            "lower": round(lower, 2),
+        })
+
+    # Downsample to ~120 display points
+    if len(full) > 120:
+        step = len(full) / 120
+        sampled = []
+        for j in range(120):
+            sampled.append(full[int(j * step)])
+        # Always include the last point
+        if sampled[-1] is not full[-1]:
+            sampled[-1] = full[-1]
+        return sampled
+    return full
+
+
 # =============================================================================
 # R2 DISCOVERY
 # =============================================================================
@@ -737,7 +794,10 @@ def build_chart_data(snapshots, positions_rows, ticker_label):
             "cum_pnl": cum_pnl,
         })
 
-    return {"mid_series": mid_series, "pnl_series": pnl_series}
+    # MR band series
+    mr_series = compute_mr_series(snapshots)
+
+    return {"mid_series": mid_series, "pnl_series": pnl_series, "mr_series": mr_series}
 
 
 def compute_order_activity(trades, events):
@@ -1599,6 +1659,103 @@ function buildSVG(series, opts) {
   return svg;
 }
 
+function buildMRSVG(mrSeries, markers, opts) {
+  const W = opts.width || 600;
+  const H = opts.height || 200;
+  const pad = {top:10, right:10, bottom:22, left:45};
+  const cw = W - pad.left - pad.right;
+  const ch = H - pad.top - pad.bottom;
+
+  if (!mrSeries || mrSeries.length < 2) {
+    return '<svg width="'+W+'" height="'+H+'"><text x="'+W/2+'" y="'+H/2+'" fill="#8b949e" text-anchor="middle" font-size="12">No MR data</text></svg>';
+  }
+
+  // Compute x (minutes) from first timestamp
+  const refTime = new Date(mrSeries[0].time).getTime();
+  const pts = mrSeries.map(p => ({
+    x: (new Date(p.time).getTime() - refTime) / 60000,
+    mid: p.mid, mean: p.mean, upper: p.upper, lower: p.lower
+  }));
+
+  const allX = pts.map(p => p.x);
+  let allY = [];
+  pts.forEach(p => { allY.push(p.mid, p.upper, p.lower); });
+  // Include marker prices in Y range
+  if (markers) markers.forEach(m => { allY.push(m.price); });
+
+  let xMin = Math.min(...allX), xMax = Math.max(...allX);
+  let yMin = Math.min(...allY), yMax = Math.max(...allY);
+  if (xMax === xMin) xMax = xMin + 1;
+  if (yMax === yMin) { yMin -= 1; yMax += 1; }
+  const yPad = (yMax - yMin) * 0.1;
+  yMin -= yPad; yMax += yPad;
+
+  function sx(v) { return pad.left + (v - xMin)/(xMax - xMin) * cw; }
+  function sy(v) { return pad.top + (1 - (v - yMin)/(yMax - yMin)) * ch; }
+
+  let svg = '<svg width="'+W+'" height="'+H+'" xmlns="http://www.w3.org/2000/svg">';
+
+  // Gridlines
+  const yTicks = 5;
+  for (let i = 0; i <= yTicks; i++) {
+    const v = yMin + (yMax-yMin)*i/yTicks;
+    const y = sy(v);
+    svg += '<line x1="'+pad.left+'" y1="'+y+'" x2="'+(W-pad.right)+'" y2="'+y+'" stroke="#21262d" stroke-width="1"/>';
+    svg += '<text x="'+(pad.left-4)+'" y="'+(y+3)+'" fill="#8b949e" font-size="10" text-anchor="end">'+v.toFixed(1)+'</text>';
+  }
+  // X-axis ticks
+  const xTicks = 5;
+  for (let i = 0; i <= xTicks; i++) {
+    const v = xMin + (xMax-xMin)*i/xTicks;
+    const x = sx(v);
+    svg += '<text x="'+x+'" y="'+(H-4)+'" fill="#8b949e" font-size="10" text-anchor="middle">'+v.toFixed(0)+'m</text>';
+  }
+
+  // Band fill (semi-transparent polygon between upper and lower)
+  let bandPath = '';
+  pts.forEach((p,i) => { bandPath += (i===0?'M':'L') + sx(p.x).toFixed(1)+','+sy(p.upper).toFixed(1)+' '; });
+  for (let i = pts.length-1; i >= 0; i--) { bandPath += 'L'+sx(pts[i].x).toFixed(1)+','+sy(pts[i].lower).toFixed(1)+' '; }
+  bandPath += 'Z';
+  svg += '<path d="'+bandPath+'" fill="rgba(188,140,255,0.08)"/>';
+
+  // Upper band line (dashed)
+  let upperD = 'M';
+  pts.forEach((p,i) => { upperD += (i?'L':'') + sx(p.x).toFixed(1)+','+sy(p.upper).toFixed(1)+' '; });
+  svg += '<path d="'+upperD+'" fill="none" stroke="#6e4da0" stroke-width="1" stroke-dasharray="4,3"/>';
+
+  // Lower band line (dashed)
+  let lowerD = 'M';
+  pts.forEach((p,i) => { lowerD += (i?'L':'') + sx(p.x).toFixed(1)+','+sy(p.lower).toFixed(1)+' '; });
+  svg += '<path d="'+lowerD+'" fill="none" stroke="#6e4da0" stroke-width="1" stroke-dasharray="4,3"/>';
+
+  // Mean line (dashed purple)
+  let meanD = 'M';
+  pts.forEach((p,i) => { meanD += (i?'L':'') + sx(p.x).toFixed(1)+','+sy(p.mean).toFixed(1)+' '; });
+  svg += '<path d="'+meanD+'" fill="none" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="6,3"/>';
+
+  // Mid price line (solid blue)
+  let midD = 'M';
+  pts.forEach((p,i) => { midD += (i?'L':'') + sx(p.x).toFixed(1)+','+sy(p.mid).toFixed(1)+' '; });
+  svg += '<path d="'+midD+'" fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round"/>';
+
+  // Trade markers
+  if (markers && markers.length > 0) {
+    markers.forEach(m => {
+      const mx = sx((new Date(m.time).getTime() - refTime) / 60000);
+      const my = sy(m.price);
+      if (mx < pad.left || mx > W - pad.right) return;
+      if (m.type === 'entry') {
+        svg += '<polygon points="'+(mx-5)+','+(my+5)+' '+mx+','+(my-5)+' '+(mx+5)+','+(my+5)+'" fill="'+(m.side==='yes'?'#3fb950':'#f85149')+'" opacity="0.9"/>';
+      } else {
+        svg += '<polygon points="'+(mx-5)+','+(my-5)+' '+mx+','+(my+5)+' '+(mx+5)+','+(my-5)+'" fill="#d29922" opacity="0.9"/>';
+      }
+    });
+  }
+
+  svg += '</svg>';
+  return svg;
+}
+
 // ─── RENDER FUNCTIONS ───
 function renderPortfolio(p) {
   const risked = p.capital_risked || 0;
@@ -1791,12 +1948,15 @@ function renderGames(data) {
   const hideInactive = document.getElementById('hideInactive').checked;
 
   data.games.forEach(game => {
-    // Skip inactive games: no bid/ask on any ticker, no open positions, no capital risked
+    // Skip inactive games: market settled/empty, no open positions, no capital risked
     if (hideInactive) {
-      const hasMarket = (game.tickers||[]).some(t => t.yes_bid || t.yes_ask);
+      const hasActiveMarket = (game.tickers||[]).some(t => {
+        const mid = t.mid || 0;
+        return mid > 3 && mid < 97;  // not settled near 0 or 100
+      });
       const hasPositions = (game.open_positions||[]).length > 0;
       const hasRisked = (game.tickers||[]).some(t => (t.capital_risked||0) > 0);
-      if (!hasMarket && !hasPositions && !hasRisked) return;
+      if (!hasActiveMarket && !hasPositions && !hasRisked) return;
     }
 
     const sec = document.createElement('div');
@@ -1865,6 +2025,23 @@ function renderGames(data) {
     html += '</tr>';
 
     html += '</table>';
+
+    // Per-ticker MR strategy charts
+    (game.tickers||[]).forEach(t => {
+      const mr = t.chart?.mr_series;
+      if (!mr || mr.length < 2) return;
+      const chartW = Math.min(800, window.innerWidth - 80);
+      // Legend
+      html += '<div style="margin-top:12px;margin-bottom:4px;display:flex;align-items:center;gap:16px;">';
+      html += '<span style="font-size:12px;font-weight:bold;color:var(--text1);">MR: '+t.label+'</span>';
+      html += '<span style="font-size:11px;color:#58a6ff;">&#9644; Mid</span>';
+      html += '<span style="font-size:11px;color:#bc8cff;">&#9472;&#9472; Mean</span>';
+      html += '<span style="font-size:11px;color:#6e4da0;">&#9618; Entry Bands</span>';
+      html += '</div>';
+      // Build markers for this ticker
+      const mrMarkers = (t.markers||[]);
+      html += '<div class="mr-chart">' + buildMRSVG(mr, mrMarkers, {width:chartW, height:200}) + '</div>';
+    });
 
     // Open positions
     if (game.open_positions && game.open_positions.length > 0) {
