@@ -438,6 +438,8 @@ def discover_games(date_str: str):
                             "game": game,
                             "tickers": sorted(tickers),
                             "prefix": game_prefix,
+                            "sport": sport,
+                            "event": event,
                         })
                         seen_games.add(game)
                     elif _has_csv_files(game_prefix):
@@ -446,6 +448,8 @@ def discover_games(date_str: str):
                             "game": game,
                             "tickers": ["_root"],
                             "prefix_override": game_prefix,
+                            "sport": sport,
+                            "event": event,
                         })
                         seen_games.add(game)
     except Exception as e:
@@ -773,25 +777,28 @@ def build_dashboard_data(date_str: str):
 
     for game_info in games:
         game_key = game_info["game"]
+        game_sport = game_info.get("sport", "cbb")
         game_data = {
             "game": game_key.replace("_", " "),
+            "sport": game_sport,
             "tickers": [],
             "events": [],
             "game_progress": None,
             "espn_wp": None,
         }
 
-        # ESPN live scores
-        try:
-            score_info = _get_game_score(game_key)
-            if score_info:
-                game_data["team_score"] = score_info.get("team_score")
-                game_data["opp_score"] = score_info.get("opp_score")
-                game_data["score_display"] = score_info.get("score_display", "")
-                game_data["clock_display"] = score_info.get("clock_display", "")
-                game_data["game_state"] = score_info.get("game_state", "")
-        except Exception as e:
-            print(f"[dashboard] ESPN score fetch error for {game_key}: {e}")
+        # ESPN live scores (CBB only — tennis has no ESPN clock)
+        if game_sport != "tennis":
+            try:
+                score_info = _get_game_score(game_key)
+                if score_info:
+                    game_data["team_score"] = score_info.get("team_score")
+                    game_data["opp_score"] = score_info.get("opp_score")
+                    game_data["score_display"] = score_info.get("score_display", "")
+                    game_data["clock_display"] = score_info.get("clock_display", "")
+                    game_data["game_state"] = score_info.get("game_state", "")
+            except Exception as e:
+                print(f"[dashboard] ESPN score fetch error for {game_key}: {e}")
 
         all_open_positions = []
         all_closed_stats = []
@@ -1197,6 +1204,7 @@ svg text { font-family:inherit; }
   <h1>KALSHI LIVE DASHBOARD</h1>
   <div class="header-right">
     <span class="sync" id="syncLabel">Connecting...</span>
+    <label>Sport: <select id="sportSelect"><option value="all">All</option><option value="cbb">CBB</option><option value="tennis">Tennis</option></select></label>
     <label>Date: <select id="dateSelect"></select></label>
   </div>
 </div>
@@ -1573,12 +1581,17 @@ function renderGames(data) {
     const sec = document.createElement('div');
     sec.className = 'game-section';
 
+    const isTennis = (game.sport||'cbb') === 'tennis';
+    const typeLabel = isTennis ? 'MATCH' : 'GAME';
     const progress = game.game_progress != null ? (game.game_progress*100).toFixed(0)+'%' : '--';
     const wp = game.espn_wp != null ? (game.espn_wp > 1 ? game.espn_wp.toFixed(0) : (game.espn_wp*100).toFixed(0))+'%' : '--';
-    const scorePart = game.score_display ? '<span style="color:var(--white);font-size:14px;font-weight:bold;">'+game.score_display+'</span> <span style="color:var(--text2);font-size:12px;">'+( game.clock_display||'')+'</span> &nbsp; ' : '';
+    const scorePart = (!isTennis && game.score_display) ? '<span style="color:var(--white);font-size:14px;font-weight:bold;">'+game.score_display+'</span> <span style="color:var(--text2);font-size:12px;">'+( game.clock_display||'')+'</span> &nbsp; ' : '';
+    const sportBadge = isTennis ? '<span class="tag" style="background:#1a3a1a;color:#3fb950;margin-right:6px;">TENNIS</span>' : '';
 
-    let html = '<div class="game-header"><span class="title">GAME: '+game.game+'</span>';
-    html += '<span class="meta">'+scorePart+'Progress: '+progress+' &nbsp; ESPN WP: '+wp+'</span></div>';
+    let html = '<div class="game-header"><span class="title">'+sportBadge+typeLabel+': '+game.game+'</span>';
+    const metaParts = [scorePart, 'Progress: '+progress];
+    if (!isTennis) metaParts.push('ESPN WP: '+wp);
+    html += '<span class="meta">'+metaParts.join(' &nbsp; ')+'</span></div>';
 
     // Ticker table
     html += '<h3>Tickers</h3>';
@@ -1716,14 +1729,53 @@ async function fetchDates() {
 async function fetchData() {
   const date = document.getElementById('dateSelect').value;
   if (!date) return;
+  const sportFilter = document.getElementById('sportSelect').value;
   try {
     const resp = await fetch('/api/data?date='+date);
     const data = await resp.json();
     lastFetchTime = Date.now();
+
+    // Filter games by selected sport
+    const allGames = data.games || [];
+    if (sportFilter !== 'all') {
+      data.games = allGames.filter(g => (g.sport || 'cbb') === sportFilter);
+    }
+
+    // Recompute portfolio totals for filtered games
+    if (sportFilter !== 'all') {
+      const port = {total_pnl:0, realized:0, unrealized:0, capital_risked:0, open_count:0, wins:0, losses:0, win_rate:0, roi_pct:0};
+      const mvs = {ml_realized:0, ml_unrealized:0, ml_total:0, ml_risked:0, spread_realized:0, spread_unrealized:0, spread_total:0, spread_risked:0};
+      data.games.forEach(g => {
+        (g.tickers||[]).forEach(t => {
+          port.realized += t.realized||0;
+          port.unrealized += t.unrealized||0;
+          port.capital_risked += t.capital_risked||0;
+          port.open_count += t.open_count||0;
+        });
+        (g.closed_stats||[]).forEach(s => { port.wins += s.wins||0; port.losses += s.losses||0; });
+        const ml = g.ml_pnl||{}; const sp = g.spread_pnl||{};
+        mvs.ml_realized += ml.realized||0; mvs.ml_unrealized += ml.unrealized||0; mvs.ml_risked += ml.risked||0;
+        mvs.spread_realized += sp.realized||0; mvs.spread_unrealized += sp.unrealized||0; mvs.spread_risked += sp.risked||0;
+      });
+      port.total_pnl = port.realized + port.unrealized;
+      const total = port.wins + port.losses;
+      port.win_rate = total > 0 ? port.wins / total : 0;
+      port.roi_pct = port.capital_risked ? (port.total_pnl / port.capital_risked * 100) : 0;
+      mvs.ml_total = mvs.ml_realized + mvs.ml_unrealized;
+      mvs.spread_total = mvs.spread_realized + mvs.spread_unrealized;
+      data.portfolio = port;
+      data.ml_vs_spread = mvs;
+    }
+
     renderPortfolio(data.portfolio || {});
     renderMlVsSpread(data.ml_vs_spread || {});
     renderCharts(data);
     renderGames(data);
+
+    // Hide ML vs Spread row when no CBB games visible
+    const hasCbb = (data.games||[]).some(g => (g.sport||'cbb') === 'cbb');
+    document.getElementById('mlVsSpread').style.display = hasCbb ? '' : 'none';
+
     updateSync();
   } catch(e) {
     console.error('fetchData error:', e);
@@ -1745,6 +1797,7 @@ fetchDates().then(() => fetchData());
 setInterval(fetchData, REFRESH_MS);
 setInterval(updateSync, 1000);
 document.getElementById('dateSelect').addEventListener('change', fetchData);
+document.getElementById('sportSelect').addEventListener('change', fetchData);
 </script>
 </body>
 </html>

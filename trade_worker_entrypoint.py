@@ -21,8 +21,19 @@ def bootstrap_kalshi_key_from_env():
     print(f"[bootstrap] Wrote Kalshi key to {key_path}")
 
 def run_once() -> int:
-    # Run the worker-friendly runner (this already handles R2 sync internally)
-    p = subprocess.run(["python", "tonight_runner_cloud.py"], check=False)
+    sport = (os.getenv("SPORT") or "cbb").strip().lower()
+
+    if sport == "tennis":
+        cmd = ["python", "tennis_runner.py", "--cloud"]
+        bundle_path = os.getenv("TENNIS_BUNDLE_PATH", "").strip()
+        if bundle_path:
+            cmd.extend(["--bundle", bundle_path])
+        print(f"[entrypoint] SPORT=tennis → {' '.join(cmd)}")
+    else:
+        cmd = ["python", "tonight_runner_cloud.py"]
+        print(f"[entrypoint] SPORT={sport} → {' '.join(cmd)}")
+
+    p = subprocess.run(cmd, check=False)
     return int(p.returncode or 0)
 
 def main():
