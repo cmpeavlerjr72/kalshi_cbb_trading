@@ -951,10 +951,20 @@ def build_dashboard_data(date_str: str):
 _bg_data = {}       # date_str -> full dashboard payload
 _bg_data_lock = threading.Lock()
 _bg_active_date = None  # date the poller is currently refreshing
+_bg_wake = threading.Event()  # signal poller to fetch immediately
+
+_EMPTY_PAYLOAD = lambda date_str: {
+    "date": date_str, "games": [],
+    "fetch_time": datetime.now(timezone.utc).isoformat(),
+    "portfolio": {"total_pnl": 0, "realized": 0, "unrealized": 0,
+                  "open_count": 0, "wins": 0, "losses": 0, "win_rate": 0},
+    "ml_vs_spread": {"ml_realized": 0, "ml_unrealized": 0, "ml_total": 0,
+                     "spread_realized": 0, "spread_unrealized": 0, "spread_total": 0},
+}
 
 
 def _bg_poller():
-    """Background thread: continuously rebuilds dashboard data every 15s."""
+    """Background thread: rebuilds dashboard data, then waits 15s or until woken."""
     while True:
         date_str = _bg_active_date
         if date_str:
@@ -968,38 +978,23 @@ def _bg_poller():
                 print(f"[poller] Refreshed {date_str}: {ng} games in {elapsed:.1f}s")
             except Exception as e:
                 print(f"[poller] Error building data for {date_str}: {e}")
-        time.sleep(15)
+        _bg_wake.wait(timeout=15)
+        _bg_wake.clear()
 
 
 def get_cached_data(date_str):
-    """Return cached dashboard data instantly, or a loading stub."""
+    """Return cached data instantly. Never blocks — poller fills data in background."""
     global _bg_active_date
 
-    # Tell poller which date to fetch
+    # Tell poller which date to fetch; wake it immediately on date change
     if _bg_active_date != date_str:
         _bg_active_date = date_str
-        # Clear stale cache for old date
-        with _bg_data_lock:
-            pass  # poller will populate on next cycle
+        _bg_wake.set()  # wake poller now
 
     with _bg_data_lock:
         cached = _bg_data.get(date_str)
 
-    if cached:
-        return cached
-
-    # Nothing cached yet — try a quick synchronous build (first load)
-    # This runs once; after that the poller keeps it fresh
-    try:
-        payload = build_dashboard_data(date_str)
-        with _bg_data_lock:
-            _bg_data[date_str] = payload
-        return payload
-    except Exception as e:
-        print(f"[dashboard] Initial build error: {e}")
-        return {"date": date_str, "games": [], "fetch_time": datetime.now(timezone.utc).isoformat(),
-                "portfolio": {"total_pnl": 0, "realized": 0, "unrealized": 0, "open_count": 0, "wins": 0, "losses": 0, "win_rate": 0},
-                "ml_vs_spread": {"ml_realized": 0, "ml_unrealized": 0, "ml_total": 0, "spread_realized": 0, "spread_unrealized": 0, "spread_total": 0}}
+    return cached if cached else _EMPTY_PAYLOAD(date_str)
 
 
 # =============================================================================
