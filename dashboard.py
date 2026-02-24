@@ -1249,29 +1249,33 @@ function fmtAge(secs) {
 }
 
 function fmtSignal(sig) {
+  // MR signal: how close is the mid price to triggering a mean-reversion entry?
+  // Below mean → would buy YES (bet price reverts up)
+  // Above mean → would buy NO (bet price reverts down)
   if (!sig) return '<span style="color:var(--text2)">--</span>';
-  if (sig.status === 'dead') return '<span style="color:var(--text2)">DEAD</span>';
+  if (sig.status === 'dead') return '<span style="color:var(--text2)" title="Price not moving enough for MR">FLAT</span>';
   const dev = sig.mr_deviation;
   const thr = sig.mr_threshold;
   const pct = sig.mr_pct;
-  const dir = dev > 0 ? 'HIGH' : 'LOW';
-  const absDev = Math.abs(dev).toFixed(1);
+  // Which side the MR strategy would buy
+  const side = dev < 0 ? 'YES' : 'NO';
+  const sideColor = dev < 0 ? '#3fb950' : '#f85149';
   const dist = Math.abs(Math.abs(dev) - thr).toFixed(1);
 
   if (pct >= 100) {
-    return '<span style="color:#f85149;font-weight:bold;">TRIGGERED (' + dir + ')</span>';
+    return '<span style="color:'+sideColor+';font-weight:bold;" title="Mid is '+Math.abs(dev).toFixed(1)+'c from mean (threshold: '+thr.toFixed(1)+'c)">BUY '+side+'</span>';
   }
-  // Color: green < 50%, yellow 50-80%, orange 80-95%, red 95%+
+  // Color ramp: far from trigger → close to trigger
   let color = '#3fb950';
   if (pct >= 95) color = '#f85149';
   else if (pct >= 80) color = '#d29922';
   else if (pct >= 50) color = '#e3b341';
 
-  // Mini bar
+  // Mini progress bar
   const barW = Math.min(pct, 100);
   const bar = '<span style="display:inline-block;width:40px;height:6px;background:var(--bg3);border-radius:3px;vertical-align:middle;margin-left:4px;">'
     + '<span style="display:block;width:'+barW+'%;height:100%;background:'+color+';border-radius:3px;"></span></span>';
-  return '<span style="color:'+color+'">'+dist+'c ('+dir+')'+bar+'</span>';
+  return '<span style="color:'+color+'" title="Mid is '+Math.abs(dev).toFixed(1)+'c from mean (need '+thr.toFixed(1)+'c to trigger '+side+' entry)">'+dist+'c to '+side+bar+'</span>';
 }
 
 // ─── SVG CHART HELPER ───
@@ -1529,7 +1533,7 @@ function renderGames(data) {
 
     // Ticker table
     html += '<h3>Tickers</h3>';
-    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>Signal</th><th>Open</th><th>Realized</th><th>Unrealized</th><th>Total</th></tr>';
+    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>MR Entry</th><th>Open</th><th>Realized</th><th>Unrealized</th><th>Total</th></tr>';
     (game.tickers||[]).forEach(t => {
       const typeTag = t.type==='ML'?'tag-ml':'tag-spread';
       const tickTotal = (t.realized||0) + (t.unrealized||0);
