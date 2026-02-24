@@ -726,6 +726,36 @@ def build_chart_data(snapshots, positions_rows, ticker_label):
     return {"mid_series": mid_series, "pnl_series": pnl_series}
 
 
+def compute_order_activity(trades):
+    """
+    Summarize order attempts from trades.csv.
+    Returns dict with counts and the last order attempt info.
+    """
+    attempts = 0
+    fills = 0
+    nofills = 0
+    skips = 0
+    last_attempt = None
+
+    for t in trades:
+        action = t.get("action", "")
+        if "entry_fill" in action:
+            attempts += 1
+            fills += 1
+            last_attempt = {"action": "fill", "side": t.get("side", ""), "price": t.get("intended_price", ""), "time": t.get("timestamp", "")}
+        elif "entry_nofill" in action:
+            attempts += 1
+            nofills += 1
+            last_attempt = {"action": "nofill", "side": t.get("side", ""), "price": t.get("intended_price", ""), "time": t.get("timestamp", "")}
+
+    return {
+        "attempts": attempts,
+        "fills": fills,
+        "nofills": nofills,
+        "last": last_attempt,
+    }
+
+
 def build_trade_markers(trades, positions_rows):
     """Build entry/exit markers for chart overlay."""
     markers = []
@@ -885,6 +915,7 @@ def build_dashboard_data(date_str: str):
             # Charts
             chart_data = build_chart_data(snapshots, positions, ticker_label)
             trade_markers = build_trade_markers(trades, positions)
+            order_activity = compute_order_activity(trades)
 
             # MR signal proximity
             try:
@@ -908,6 +939,7 @@ def build_dashboard_data(date_str: str):
                 "chart": chart_data,
                 "markers": trade_markers,
                 "mr_signal": mr_signal,
+                "orders": order_activity,
             }
             game_data["tickers"].append(ticker_data)
 
@@ -1301,6 +1333,24 @@ function fmtAge(secs) {
   return Math.floor(secs/3600) + 'h ' + Math.floor((secs%3600)/60) + 'm';
 }
 
+function fmtOrders(ord) {
+  if (!ord || ord.attempts === 0) return '<span style="color:var(--text2)">--</span>';
+  const f = ord.fills, nf = ord.nofills;
+  let parts = [];
+  if (f > 0) parts.push('<span style="color:var(--green)">'+f+' fill'+(f>1?'s':'')+'</span>');
+  if (nf > 0) parts.push('<span style="color:var(--orange)">'+nf+' nofill'+(nf>1?'s':'')+'</span>');
+  let html = parts.join(' / ');
+  if (ord.last) {
+    const ago = ord.last.time ? fmtTime(ord.last.time) : '';
+    const side = (ord.last.side||'').toUpperCase();
+    const sideColor = ord.last.side === 'yes' ? 'var(--green)' : 'var(--red)';
+    const icon = ord.last.action === 'fill' ? '&#10003;' : '&#10007;';
+    const iconColor = ord.last.action === 'fill' ? 'var(--green)' : 'var(--orange)';
+    html += '<br><span style="font-size:10px;color:var(--text2)">Last: <span style="color:'+iconColor+'">'+icon+'</span> <span style="color:'+sideColor+'">'+side+'</span> @'+ord.last.price+'c '+ago+'</span>';
+  }
+  return html;
+}
+
 function fmtSignal(sig) {
   // MR signal: show the trigger price needed for next entry
   // Below mean → would buy YES at yes_trigger price
@@ -1602,7 +1652,7 @@ function renderGames(data) {
 
     // Ticker table
     html += '<h3>Tickers</h3>';
-    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>MR Entry</th><th>Open</th><th>Risked</th><th>Realized</th><th>Unrealized</th><th>Total</th></tr>';
+    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>MR Entry</th><th>Orders</th><th>Open</th><th>Risked</th><th>Realized</th><th>Unrealized</th><th>Total</th></tr>';
     (game.tickers||[]).forEach(t => {
       const typeTag = t.type==='ML'?'tag-ml':'tag-spread';
       const tickTotal = (t.realized||0) + (t.unrealized||0);
@@ -1614,6 +1664,7 @@ function renderGames(data) {
       html += '<td>'+(t.mid?t.mid.toFixed(1):'--')+'</td>';
       html += '<td>'+(t.spread||'--')+'</td>';
       html += '<td>'+fmtSignal(t.mr_signal)+'</td>';
+      html += '<td>'+fmtOrders(t.orders)+'</td>';
       html += '<td>'+t.open_count+'</td>';
       html += '<td>'+fmtRisked(risked)+'</td>';
       html += '<td class="'+pnlClass(t.realized)+'" title="'+fmtCents(t.realized)+' on '+fmtRisked(risked)+' risked">'+fmtPct(t.realized,risked)+'</td>';
@@ -1625,7 +1676,7 @@ function renderGames(data) {
     // ML subtotal row
     const mlPnl = game.ml_pnl || {realized:0, unrealized:0, total:0, risked:0};
     html += '<tr style="border-top:2px solid #1f3a5f;background:#0d1a2d;">';
-    html += '<td colspan="8" style="text-align:right;"><span class="tag tag-ml">ML</span> <b>Subtotal</b></td>';
+    html += '<td colspan="9" style="text-align:right;"><span class="tag tag-ml">ML</span> <b>Subtotal</b></td>';
     html += '<td class="'+pnlClass(mlPnl.realized)+'">'+fmtPct(mlPnl.realized,mlPnl.risked)+'</td>';
     html += '<td class="'+pnlClass(mlPnl.unrealized)+'">'+fmtPct(mlPnl.unrealized,mlPnl.risked)+'</td>';
     html += '<td class="'+pnlClass(mlPnl.total)+'"><b>'+fmtPct(mlPnl.total,mlPnl.risked)+' ('+fmtCents(mlPnl.total)+')</b></td>';
@@ -1634,7 +1685,7 @@ function renderGames(data) {
     // Spread subtotal row
     const spPnl = game.spread_pnl || {realized:0, unrealized:0, total:0, risked:0};
     html += '<tr style="border-top:2px solid #3b2e1a;background:#1a1508;">';
-    html += '<td colspan="8" style="text-align:right;"><span class="tag tag-spread">SPREAD</span> <b>Subtotal</b></td>';
+    html += '<td colspan="9" style="text-align:right;"><span class="tag tag-spread">SPREAD</span> <b>Subtotal</b></td>';
     html += '<td class="'+pnlClass(spPnl.realized)+'">'+fmtPct(spPnl.realized,spPnl.risked)+'</td>';
     html += '<td class="'+pnlClass(spPnl.unrealized)+'">'+fmtPct(spPnl.unrealized,spPnl.risked)+'</td>';
     html += '<td class="'+pnlClass(spPnl.total)+'"><b>'+fmtPct(spPnl.total,spPnl.risked)+' ('+fmtCents(spPnl.total)+')</b></td>';
@@ -1644,7 +1695,7 @@ function renderGames(data) {
     const gameTotal = mlPnl.total + spPnl.total;
     const gameRisked = (mlPnl.risked||0) + (spPnl.risked||0);
     html += '<tr style="border-top:2px solid var(--border);background:var(--bg3);">';
-    html += '<td colspan="8" style="text-align:right;"><b>Game Total</b></td>';
+    html += '<td colspan="9" style="text-align:right;"><b>Game Total</b></td>';
     html += '<td></td><td></td>';
     html += '<td class="'+pnlClass(gameTotal)+'"><b>'+fmtPct(gameTotal,gameRisked)+' ('+fmtCents(gameTotal)+')</b></td>';
     html += '</tr>';
