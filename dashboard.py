@@ -309,6 +309,83 @@ def compute_mr_signal(snapshots, sport="cbb"):
     }
 
 
+def compute_ra_signal(snapshots):
+    """
+    Compute current RA signal state from snapshot history.
+    Uses EMA fast + TMA slow (ema_tma mode) matching the live tennis strategy.
+    Returns dict with current signal, MA values, proximity to threshold crossing.
+    """
+    # Load params from strategy_config.json if available, else use defaults
+    fast_window = 40
+    slow_window = 160
+    threshold = 12
+    try:
+        cfg_path = Path(__file__).parent / "strategy_config.json"
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text())
+            ra = cfg.get("rolling_avg", {})
+            fast_window = int(ra.get("fast_window", fast_window))
+            slow_window = int(ra.get("slow_window", slow_window))
+            threshold = float(ra.get("threshold_cents", threshold))
+    except Exception:
+        pass
+
+    mids = []
+    for s in snapshots:
+        v = s.get("mid")
+        if v:
+            try:
+                mids.append(float(v))
+            except (ValueError, TypeError):
+                pass
+
+    half = max(2, slow_window // 2)
+    warmup = slow_window + half
+    if len(mids) < warmup:
+        return None
+
+    # Compute EMA fast
+    alpha = 2.0 / (fast_window + 1)
+    ema = mids[0]
+    for m in mids[1:]:
+        ema = alpha * m + (1 - alpha) * ema
+
+    # Compute TMA slow: SMA of mids → then average of recent SMA values
+    sma_series = []
+    for i in range(len(mids)):
+        if i + 1 < slow_window:
+            sma_series.append(None)
+        else:
+            window = mids[i - slow_window + 1:i + 1]
+            sma_series.append(sum(window) / slow_window)
+
+    # TMA = average of last half SMA values
+    recent_sma = [v for v in sma_series[-half:] if v is not None]
+    if len(recent_sma) < half:
+        return None
+    tma = sum(recent_sma) / len(recent_sma)
+
+    spread_cents = ema - tma
+    pct = abs(spread_cents) / threshold * 100 if threshold > 0 else 0
+
+    signal = None
+    if ema > tma + threshold:
+        signal = "yes"
+    elif ema < tma - threshold:
+        signal = "no"
+
+    return {
+        "strategy": "rolling_avg",
+        "fast_ma": round(ema, 2),
+        "slow_ma": round(tma, 2),
+        "spread_cents": round(spread_cents, 2),
+        "threshold": threshold,
+        "pct": round(min(pct, 999), 1),
+        "signal": signal,
+        "current_mid": round(mids[-1], 1),
+    }
+
+
 def compute_mr_series(snapshots, sport="cbb", trade_markers=None):
     """
     Walk all valid snapshots and compute rolling MR bands at each point.
@@ -400,6 +477,123 @@ def compute_mr_series(snapshots, sport="cbb", trade_markers=None):
     for j in range(TARGET):
         sampled_indices.add(int(j * step))
     sampled_indices.add(len(full) - 1)  # always include last
+    sampled_indices |= keep
+
+    result = [full[i] for i in sorted(sampled_indices)]
+    return result
+
+
+def compute_ra_series(snapshots, trade_markers=None):
+    """
+    Compute Rolling Average (MA crossover) series for chart rendering.
+    Uses EMA fast / TMA slow (matching live tennis strategy ema_tma mode).
+    Returns list of {time, mid, fast_ma, slow_ma, upper, lower} dicts.
+    """
+    # Load params from strategy_config.json if available, else use defaults
+    fast_window = 40
+    slow_window = 160
+    threshold = 12.0
+    try:
+        cfg_path = Path(__file__).parent / "strategy_config.json"
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text())
+            ra = cfg.get("rolling_avg", {})
+            fast_window = int(ra.get("fast_window", fast_window))
+            slow_window = int(ra.get("slow_window", slow_window))
+            threshold = float(ra.get("threshold_cents", threshold))
+    except Exception:
+        pass
+
+    half = max(2, slow_window // 2)
+    warmup = slow_window + half
+
+    # Extract (time, mid) pairs
+    points = []
+    for s in snapshots:
+        v = s.get("mid")
+        if not v:
+            continue
+        try:
+            mid = float(v)
+        except (ValueError, TypeError):
+            continue
+        points.append((s.get("timestamp", ""), mid))
+
+    if len(points) < warmup:
+        return []
+
+    mids = [p[1] for p in points]
+    alpha = 2.0 / (fast_window + 1)
+
+    # Walk tick-by-tick computing EMA fast + SMA/TMA slow
+    ema_fast = mids[0]
+    sma_series = []  # running SMA values for TMA computation
+    full = []
+
+    for i in range(len(points)):
+        # Update EMA fast
+        if i == 0:
+            ema_fast = mids[0]
+        else:
+            ema_fast = alpha * mids[i] + (1 - alpha) * ema_fast
+
+        # Compute SMA slow
+        if i + 1 >= slow_window:
+            window = mids[i - slow_window + 1:i + 1]
+            sma_val = sum(window) / slow_window
+        else:
+            sma_val = None
+        sma_series.append(sma_val)
+
+        # Compute TMA = average of last half SMA values
+        if i + 1 < warmup:
+            continue  # skip warmup
+        recent_sma = sma_series[i - half + 1:i + 1]
+        if None in recent_sma or len(recent_sma) < half:
+            continue
+        tma_slow = sum(recent_sma) / half
+
+        full.append({
+            "time": points[i][0],
+            "mid": round(mids[i], 2),
+            "fast_ma": round(ema_fast, 2),
+            "slow_ma": round(tma_slow, 2),
+            "upper": round(tma_slow + threshold, 2),
+            "lower": round(tma_slow - threshold, 2),
+        })
+
+    TARGET = 500
+    if len(full) <= TARGET:
+        return full
+
+    # Build set of indices that MUST be kept (near trade times)
+    keep = set()
+    if trade_markers:
+        from datetime import datetime as _dt
+        full_times = []
+        for f in full:
+            try:
+                full_times.append(_dt.fromisoformat(f["time"].replace("Z", "+00:00")).timestamp())
+            except Exception:
+                full_times.append(0)
+
+        for m in trade_markers:
+            try:
+                mt = _dt.fromisoformat(m["time"].replace("Z", "+00:00")).timestamp()
+            except Exception:
+                continue
+            best_i = min(range(len(full_times)), key=lambda i: abs(full_times[i] - mt))
+            for offset in range(-5, 6):
+                idx = best_i + offset
+                if 0 <= idx < len(full):
+                    keep.add(idx)
+
+    # Uniform downsample, then merge in kept indices
+    step = len(full) / TARGET
+    sampled_indices = set()
+    for j in range(TARGET):
+        sampled_indices.add(int(j * step))
+    sampled_indices.add(len(full) - 1)
     sampled_indices |= keep
 
     result = [full[i] for i in sorted(sampled_indices)]
@@ -846,10 +1040,13 @@ def build_chart_data(snapshots, positions_rows, ticker_label, sport="cbb",
             "cum_pnl": cum_pnl,
         })
 
-    # MR band series
-    mr_series = compute_mr_series(snapshots, sport=sport, trade_markers=trade_markers)
-
-    return {"mid_series": mid_series, "pnl_series": pnl_series, "mr_series": mr_series}
+    # Strategy-specific band series
+    if sport == "tennis":
+        ra_series = compute_ra_series(snapshots, trade_markers=trade_markers)
+        return {"mid_series": mid_series, "pnl_series": pnl_series, "ra_series": ra_series}
+    else:
+        mr_series = compute_mr_series(snapshots, sport=sport, trade_markers=trade_markers)
+        return {"mid_series": mid_series, "pnl_series": pnl_series, "mr_series": mr_series}
 
 
 def compute_order_activity(trades, events):
@@ -1069,9 +1266,12 @@ def build_dashboard_data(date_str: str):
                                           sport=game_sport, trade_markers=trade_markers)
             order_activity = compute_order_activity(trades, events)
 
-            # MR signal proximity
+            # Strategy signal proximity
             try:
-                mr_signal = compute_mr_signal(snapshots, sport=game_sport)
+                if game_sport == "tennis":
+                    mr_signal = compute_ra_signal(snapshots)
+                else:
+                    mr_signal = compute_mr_signal(snapshots, sport=game_sport)
             except Exception:
                 mr_signal = None
 
@@ -1590,10 +1790,38 @@ function fmtOrders(ord) {
 }
 
 function fmtSignal(sig) {
-  // MR signal: show the trigger price needed for next entry
-  // Below mean → would buy YES at yes_trigger price
-  // Above mean → would buy NO at no_trigger price
   if (!sig) return '<span style="color:var(--text2)">--</span>';
+
+  // RA (Rolling Average) signal: show MA crossover status
+  if (sig.strategy === 'rolling_avg') {
+    const fast = sig.fast_ma;
+    const slow = sig.slow_ma;
+    const gap = sig.spread_cents;
+    const pct = sig.pct;
+    const thr = sig.threshold;
+
+    // Color ramp based on proximity to threshold
+    let color = '#8b949e';
+    if (pct >= 100) color = gap > 0 ? '#3fb950' : '#f85149';
+    else if (pct >= 80) color = '#d29922';
+    else if (pct >= 50) color = '#e3b341';
+
+    // When threshold crossed: show BUY signal
+    if (sig.signal) {
+      const side = sig.signal === 'yes' ? 'YES' : 'NO';
+      const sideColor = sig.signal === 'yes' ? '#3fb950' : '#f85149';
+      return '<span style="color:'+sideColor+';font-weight:bold;" title="Fast: '+fast+' | Slow: '+slow+' | Gap: '+gap.toFixed(1)+'c / '+thr+'c threshold">BUY '+side+'</span>';
+    }
+
+    // Progress bar: |gap| / threshold * 100
+    const barW = Math.min(pct, 100);
+    const bar = '<span style="display:inline-block;width:40px;height:6px;background:var(--bg3);border-radius:3px;vertical-align:middle;margin-left:4px;">'
+      + '<span style="display:block;width:'+barW+'%;height:100%;background:'+color+';border-radius:3px;"></span></span>';
+    const sign = gap >= 0 ? '+' : '';
+    return '<span style="color:'+color+'" title="Fast EMA: '+fast+' | Slow TMA: '+slow+' | Threshold: '+thr+'c">Gap: '+sign+gap.toFixed(1)+'c'+bar+'</span>';
+  }
+
+  // MR signal: show the trigger price needed for next entry
   if (sig.status === 'dead') return '<span style="color:var(--text2)" title="Price not moving enough for MR">FLAT</span>';
   const dev = sig.mr_deviation;
   const pct = sig.mr_pct;
@@ -1794,6 +2022,111 @@ function buildMRSVG(mrSeries, markers, opts) {
   svg += '<path d="'+midD+'" fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round"/>';
 
   // Trade markers — convert NO-side fill prices to YES scale (chart shows YES mid)
+  if (markers && markers.length > 0) {
+    markers.forEach(m => {
+      const mx = sx((new Date(m.time).getTime() - refTime) / 60000);
+      const price = m.side === 'no' ? 100 - m.price : m.price;
+      const my = sy(price);
+      if (mx < pad.left || mx > W - pad.right) return;
+      if (m.type === 'entry') {
+        svg += '<polygon points="'+(mx-5)+','+(my+5)+' '+mx+','+(my-5)+' '+(mx+5)+','+(my+5)+'" fill="'+(m.side==='yes'?'#3fb950':'#f85149')+'" opacity="0.9"/>';
+      } else {
+        svg += '<polygon points="'+(mx-5)+','+(my-5)+' '+mx+','+(my+5)+' '+(mx+5)+','+(my-5)+'" fill="#d29922" opacity="0.9"/>';
+      }
+    });
+  }
+
+  svg += '</svg>';
+  return svg;
+}
+
+function buildRASVG(raSeries, markers, opts) {
+  const W = opts.width || 600;
+  const H = opts.height || 200;
+  const pad = {top:10, right:10, bottom:22, left:45};
+  const cw = W - pad.left - pad.right;
+  const ch = H - pad.top - pad.bottom;
+
+  if (!raSeries || raSeries.length < 2) {
+    return '<svg width="'+W+'" height="'+H+'"><text x="'+W/2+'" y="'+H/2+'" fill="#8b949e" text-anchor="middle" font-size="12">No RA data</text></svg>';
+  }
+
+  // Compute x (minutes) from first timestamp
+  const refTime = new Date(raSeries[0].time).getTime();
+  const pts = raSeries.map(p => ({
+    x: (new Date(p.time).getTime() - refTime) / 60000,
+    mid: p.mid, fast_ma: p.fast_ma, slow_ma: p.slow_ma, upper: p.upper, lower: p.lower
+  }));
+
+  const allX = pts.map(p => p.x);
+  let allY = [];
+  pts.forEach(p => { allY.push(p.mid, p.fast_ma, p.slow_ma, p.upper, p.lower); });
+  // Include marker prices in Y range
+  if (markers) markers.forEach(m => {
+    allY.push(m.side === 'no' ? 100 - m.price : m.price);
+  });
+
+  let xMin = Math.min(...allX), xMax = Math.max(...allX);
+  let yMin = Math.min(...allY), yMax = Math.max(...allY);
+  if (xMax === xMin) xMax = xMin + 1;
+  if (yMax === yMin) { yMin -= 1; yMax += 1; }
+  const yPad = (yMax - yMin) * 0.1;
+  yMin -= yPad; yMax += yPad;
+
+  function sx(v) { return pad.left + (v - xMin)/(xMax - xMin) * cw; }
+  function sy(v) { return pad.top + (1 - (v - yMin)/(yMax - yMin)) * ch; }
+
+  let svg = '<svg width="'+W+'" height="'+H+'" xmlns="http://www.w3.org/2000/svg">';
+
+  // Gridlines
+  const yTicks = 5;
+  for (let i = 0; i <= yTicks; i++) {
+    const v = yMin + (yMax-yMin)*i/yTicks;
+    const y = sy(v);
+    svg += '<line x1="'+pad.left+'" y1="'+y+'" x2="'+(W-pad.right)+'" y2="'+y+'" stroke="#21262d" stroke-width="1"/>';
+    svg += '<text x="'+(pad.left-4)+'" y="'+(y+3)+'" fill="#8b949e" font-size="10" text-anchor="end">'+v.toFixed(1)+'</text>';
+  }
+  // X-axis ticks
+  const xTicks = 5;
+  for (let i = 0; i <= xTicks; i++) {
+    const v = xMin + (xMax-xMin)*i/xTicks;
+    const x = sx(v);
+    svg += '<text x="'+x+'" y="'+(H-4)+'" fill="#8b949e" font-size="10" text-anchor="middle">'+v.toFixed(0)+'m</text>';
+  }
+
+  // Threshold band fill (semi-transparent between upper and lower)
+  let bandPath = '';
+  pts.forEach((p,i) => { bandPath += (i===0?'M':'L') + sx(p.x).toFixed(1)+','+sy(p.upper).toFixed(1)+' '; });
+  for (let i = pts.length-1; i >= 0; i--) { bandPath += 'L'+sx(pts[i].x).toFixed(1)+','+sy(pts[i].lower).toFixed(1)+' '; }
+  bandPath += 'Z';
+  svg += '<path d="'+bandPath+'" fill="rgba(110,77,160,0.08)"/>';
+
+  // Upper threshold line (dashed)
+  let upperD = 'M';
+  pts.forEach((p,i) => { upperD += (i?'L':'') + sx(p.x).toFixed(1)+','+sy(p.upper).toFixed(1)+' '; });
+  svg += '<path d="'+upperD+'" fill="none" stroke="#6e4da0" stroke-width="1" stroke-dasharray="4,3"/>';
+
+  // Lower threshold line (dashed)
+  let lowerD = 'M';
+  pts.forEach((p,i) => { lowerD += (i?'L':'') + sx(p.x).toFixed(1)+','+sy(p.lower).toFixed(1)+' '; });
+  svg += '<path d="'+lowerD+'" fill="none" stroke="#6e4da0" stroke-width="1" stroke-dasharray="4,3"/>';
+
+  // Slow TMA line (solid cyan/teal)
+  let slowD = 'M';
+  pts.forEach((p,i) => { slowD += (i?'L':'') + sx(p.x).toFixed(1)+','+sy(p.slow_ma).toFixed(1)+' '; });
+  svg += '<path d="'+slowD+'" fill="none" stroke="#39d0d0" stroke-width="1.5" stroke-linejoin="round"/>';
+
+  // Fast EMA line (solid gold/orange)
+  let fastD = 'M';
+  pts.forEach((p,i) => { fastD += (i?'L':'') + sx(p.x).toFixed(1)+','+sy(p.fast_ma).toFixed(1)+' '; });
+  svg += '<path d="'+fastD+'" fill="none" stroke="#d29922" stroke-width="1.5" stroke-linejoin="round"/>';
+
+  // Mid price line (solid blue)
+  let midD = 'M';
+  pts.forEach((p,i) => { midD += (i?'L':'') + sx(p.x).toFixed(1)+','+sy(p.mid).toFixed(1)+' '; });
+  svg += '<path d="'+midD+'" fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round"/>';
+
+  // Trade markers — convert NO-side fill prices to YES scale
   if (markers && markers.length > 0) {
     markers.forEach(m => {
       const mx = sx((new Date(m.time).getTime() - refTime) / 60000);
@@ -2032,7 +2365,7 @@ function renderGames(data) {
 
     // Ticker table
     html += '<h3>Tickers</h3>';
-    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>MR Entry</th><th>Orders</th><th>Open</th><th>Risked</th><th>Realized</th><th>Unrealized</th><th>Total</th></tr>';
+    html += '<table><tr><th>Ticker</th><th>Type</th><th>Bid/Ask</th><th>Mid</th><th>Sprd</th><th>Signal</th><th>Orders</th><th>Open</th><th>Risked</th><th>Realized</th><th>Unrealized</th><th>Total</th></tr>';
     (game.tickers||[]).forEach(t => {
       const typeTag = t.type==='ML'?'tag-ml':'tag-spread';
       const tickTotal = (t.realized||0) + (t.unrealized||0);
@@ -2082,21 +2415,31 @@ function renderGames(data) {
 
     html += '</table>';
 
-    // Per-ticker MR strategy charts
+    // Per-ticker strategy charts (RA for tennis, MR for CBB)
     (game.tickers||[]).forEach(t => {
-      const mr = t.chart?.mr_series;
-      if (!mr || mr.length < 2) return;
       const chartW = Math.min(800, window.innerWidth - 80);
-      // Legend
-      html += '<div style="margin-top:12px;margin-bottom:4px;display:flex;align-items:center;gap:16px;">';
-      html += '<span style="font-size:12px;font-weight:bold;color:var(--text1);">MR: '+t.label+'</span>';
-      html += '<span style="font-size:11px;color:#58a6ff;">&#9644; Mid</span>';
-      html += '<span style="font-size:11px;color:#bc8cff;">&#9472;&#9472; Mean</span>';
-      html += '<span style="font-size:11px;color:#6e4da0;">&#9618; Entry Bands</span>';
-      html += '</div>';
-      // Build markers for this ticker
-      const mrMarkers = (t.markers||[]);
-      html += '<div class="mr-chart">' + buildMRSVG(mr, mrMarkers, {width:chartW, height:200}) + '</div>';
+      const tradeMarkers = (t.markers||[]);
+
+      if (isTennis && t.chart?.ra_series && t.chart.ra_series.length >= 2) {
+        // RA chart: Fast EMA + Slow TMA + threshold bands
+        html += '<div style="margin-top:12px;margin-bottom:4px;display:flex;align-items:center;gap:16px;">';
+        html += '<span style="font-size:12px;font-weight:bold;color:var(--text1);">RA: '+t.label+'</span>';
+        html += '<span style="font-size:11px;color:#58a6ff;">&#9644; Mid</span>';
+        html += '<span style="font-size:11px;color:#d29922;">&#9644; Fast EMA</span>';
+        html += '<span style="font-size:11px;color:#39d0d0;">&#9644; Slow TMA</span>';
+        html += '<span style="font-size:11px;color:#6e4da0;">&#9618; Threshold</span>';
+        html += '</div>';
+        html += '<div class="ra-chart">' + buildRASVG(t.chart.ra_series, tradeMarkers, {width:chartW, height:200}) + '</div>';
+      } else if (t.chart?.mr_series && t.chart.mr_series.length >= 2) {
+        // MR chart: mean + sigma bands
+        html += '<div style="margin-top:12px;margin-bottom:4px;display:flex;align-items:center;gap:16px;">';
+        html += '<span style="font-size:12px;font-weight:bold;color:var(--text1);">MR: '+t.label+'</span>';
+        html += '<span style="font-size:11px;color:#58a6ff;">&#9644; Mid</span>';
+        html += '<span style="font-size:11px;color:#bc8cff;">&#9472;&#9472; Mean</span>';
+        html += '<span style="font-size:11px;color:#6e4da0;">&#9618; Entry Bands</span>';
+        html += '</div>';
+        html += '<div class="mr-chart">' + buildMRSVG(t.chart.mr_series, tradeMarkers, {width:chartW, height:200}) + '</div>';
+      }
     });
 
     // Open positions
