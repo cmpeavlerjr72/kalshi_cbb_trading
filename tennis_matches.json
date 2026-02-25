@@ -7,5 +7,6 @@
   {"label": "Ugo vs Hanfmann", "player_code": "UGO", "opponent_code": "HAN", "match_key": "26FEB24UGOHAN", "model_p_win": 0.50},
   {"label": "Rindknecht vs Draper", "player_code": "RIN", "opponent_code": "DRA", "match_key": "26FEB25RINDRA", "model_p_win": 0.50},
   {"label": "Mrva vs Moro", "player_code": "MRV", "opponent_code": "MMO", "match_key": "26FEB25MRVMMO", "series": "KXATPCHALLENGERMATCH", "model_p_win": 0.50},
-  {"label": "Koueladjol vs Droguet", "player_code": "KOU", "opponent_code": "DRO", "match_key": "26FEB22KOUDRO", "series": "KXATPCHALLENGERMATCH", "model_p_win": 0.50}
+  {"label": "Koueladjol vs Droguet", "player_code": "KOU", "opponent_code": "DRO", "match_key": "26FEB22KOUDRO", "series": "KXATPCHALLENGERMATCH", "model_p_win": 0.50},
+  {"label": "Dodig vs Skatov", "player_code": "DOD", "opponent_code": "SKA", "match_key": "26FEB25DODSKA", "series": "KXATPCHALLENGERMATCH", "model_p_win": 0.50}
 ]

@@ -211,7 +211,7 @@ def find_ml_ticker_from_bundle(bundle: Dict[str, Any], player_code: str, match_k
 # ============================================================================
 
 def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any],
-              bundle: Optional[Dict[str, Any]] = None):
+              bundle: Optional[Dict[str, Any]] = None, uploader=None):
     label = match_config["label"]
     try:
         print_status(f"\n[{label}] Initializing...")
@@ -242,6 +242,13 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
         ticker_series = ml_ticker.split("-")[0] if ml_ticker else (series_override or "KXATPMATCH")
         log_dir = build_match_log_dir(label, match_date, series=ticker_series)
         log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Restore existing CSVs from R2 so GameRunner appends instead of overwriting
+        if uploader:
+            try:
+                uploader.download_match_logs(log_dir)
+            except Exception as e:
+                print_status(f"[{label}] Warning: failed to restore logs from R2: {e}")
 
         # Load strategy config overrides
         strategy_config_overrides = {}
@@ -356,8 +363,9 @@ def load_matches_from_env() -> Optional[List[Dict[str, Any]]]:
 
 
 def load_matches_from_file() -> Optional[List[Dict[str, Any]]]:
-    """Load matches from tennis_matches.json (local or R2-synced)."""
-    for path in [MATCHES_JSON_FILE, Path("tennis_matches.json")]:
+    """Load matches from tennis_matches.json (local or R2-synced).
+    Check cwd first (R2-synced copy from uploader), then repo root."""
+    for path in [Path("tennis_matches.json"), MATCHES_JSON_FILE]:
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
@@ -376,7 +384,7 @@ def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
                        results: Dict[str, Any], threads: List[threading.Thread],
                        private_key_path: str, bundle: Optional[Dict[str, Any]],
                        cloud_mode: bool, balance_per_match: float,
-                       stop_event: Optional[Any] = None):
+                       stop_event: Optional[Any] = None, uploader=None):
     """
     Periodically re-reads tennis_matches.json and launches threads for new matches.
     Runs in main thread or as a daemon thread.
@@ -410,7 +418,7 @@ def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
 
                     t = threading.Thread(
                         target=run_match,
-                        args=(m, match_pk, results, bundle),
+                        args=(m, match_pk, results, bundle, uploader),
                         name=m.get("label", mk),
                         daemon=False,
                     )
@@ -560,6 +568,7 @@ def main() -> int:
     # --- R2 uploader (cloud mode) ---
     stop = None
     uploader_thread = None
+    uploader = None
     if cloud_mode:
         LOG_ROOT.mkdir(parents=True, exist_ok=True)
         uploader = R2Uploader(local_logs_dir=LOG_ROOT)
@@ -597,7 +606,7 @@ def main() -> int:
         match_pk = _load_private_key(key_path)
         t = threading.Thread(
             target=run_match,
-            args=(match, match_pk, results, bundle),
+            args=(match, match_pk, results, bundle, uploader),
             name=match["label"],
             daemon=False,
         )
@@ -609,7 +618,7 @@ def main() -> int:
     watcher_thread = threading.Thread(
         target=match_watcher_loop,
         args=(running_keys, running_keys_lock, results, threads,
-              key_path, bundle, cloud_mode, per_match_allocation, stop),
+              key_path, bundle, cloud_mode, per_match_allocation, stop, uploader),
         name="match_watcher",
         daemon=True,
     )

@@ -242,6 +242,37 @@ class R2Uploader:
     CONFIG_R2_KEY = "kalshi/config/strategy_config.json"
     MATCHES_R2_KEY = "kalshi/config/tennis_matches.json"
 
+    CSV_FILES = ["snapshots.csv", "trades.csv", "positions.csv", "events.csv"]
+
+    def download_match_logs(self, local_log_dir: Path) -> int:
+        """
+        Download existing CSV logs from R2 into a local match log directory.
+        Call before GameRunner init so _init_logs() sees existing data and appends.
+        Returns number of files restored.
+        """
+        if not self.enabled():
+            return 0
+        local_log_dir.mkdir(parents=True, exist_ok=True)
+        rel = str(local_log_dir.relative_to(self.local_logs_dir)).replace("\\", "/")
+        restored = 0
+        for csv_name in self.CSV_FILES:
+            r2_key = f"{self.prefix}/{rel}/{csv_name}"
+            local_path = local_log_dir / csv_name
+            if local_path.exists() and local_path.stat().st_size > 0:
+                continue  # already have data, don't overwrite
+            try:
+                resp = self._client.get_object(Bucket=self.bucket, Key=r2_key)
+                data = resp["Body"].read()
+                if len(data) > 0:
+                    local_path.write_bytes(data)
+                    restored += 1
+            except Exception as e:
+                if "NoSuchKey" not in str(type(e).__name__) and "NoSuchKey" not in str(e):
+                    print_status(f"[R2] download_match_log error for {csv_name}: {e}")
+        if restored:
+            print_status(f"[R2] Restored {restored} CSV(s) for {rel}")
+        return restored
+
     def download_config(self, local_path: Path) -> bool:
         """Download strategy_config.json from R2 if content changed. Returns True if file was updated."""
         return self._download_r2_file(self.CONFIG_R2_KEY, local_path, "Config")
