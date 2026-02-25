@@ -1626,9 +1626,14 @@ select { background:var(--bg3); color:var(--text); border:1px solid var(--border
 .chart-box { background:var(--bg2); border:1px solid var(--border); border-radius:6px; padding:10px; min-height:220px; }
 .chart-box h3 { margin-bottom:6px; }
 .game-section { background:var(--bg2); border:1px solid var(--border); border-radius:6px; padding:10px 12px; margin-bottom:10px; }
-.game-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+.game-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; cursor:pointer; user-select:none; }
+.game-header:hover { background:var(--bg3); margin:-4px -6px; padding:4px 6px; border-radius:4px; }
 .game-header .title { font-size:14px; color:var(--white); font-weight:bold; }
 .game-header .meta { color:var(--text2); font-size:12px; }
+.game-header .chevron { color:var(--text2); font-size:14px; margin-right:6px; transition:transform 0.15s; display:inline-block; }
+.game-section.expanded .game-header .chevron { transform:rotate(90deg); }
+.game-details { display:none; }
+.game-section.expanded .game-details { display:block; }
 table { width:100%; border-collapse:collapse; font-size:12px; }
 th { text-align:left; color:var(--text2); font-size:11px; text-transform:uppercase; padding:4px 8px; border-bottom:1px solid var(--border); }
 td { padding:4px 8px; border-bottom:1px solid var(--bg3); }
@@ -1670,6 +1675,7 @@ svg text { font-family:inherit; }
     <label>Sport: <select id="sportSelect"><option value="all">All</option><option value="cbb">CBB</option><option value="tennis">Tennis</option></select></label>
     <label>Date: <select id="dateSelect"></select></label>
     <label><input type="checkbox" id="hideInactive" checked> Hide Inactive</label>
+    <button onclick="toggleAll()" style="background:var(--bg3);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 8px;font-family:inherit;font-size:12px;cursor:pointer;" id="toggleAllBtn">Expand All</button>
   </div>
 </div>
 
@@ -2325,6 +2331,41 @@ function renderReconciliation(data) {
   }
 }
 
+// Track which games are expanded (persists across refreshes)
+const _expandedGames = new Set();
+
+function toggleGame(gameKey) {
+  if (_expandedGames.has(gameKey)) _expandedGames.delete(gameKey);
+  else _expandedGames.add(gameKey);
+  const sec = document.querySelector('[data-game="'+CSS.escape(gameKey)+'"]');
+  if (sec) sec.classList.toggle('expanded');
+  updateToggleAllBtn();
+}
+
+function toggleAll() {
+  const sections = document.querySelectorAll('.game-section');
+  const allExpanded = _expandedGames.size > 0 && sections.length > 0 && _expandedGames.size >= sections.length;
+  if (allExpanded) {
+    _expandedGames.clear();
+    sections.forEach(s => s.classList.remove('expanded'));
+  } else {
+    sections.forEach(s => {
+      const key = s.getAttribute('data-game');
+      if (key) _expandedGames.add(key);
+      s.classList.add('expanded');
+    });
+  }
+  updateToggleAllBtn();
+}
+
+function updateToggleAllBtn() {
+  const btn = document.getElementById('toggleAllBtn');
+  if (!btn) return;
+  const sections = document.querySelectorAll('.game-section');
+  const allExpanded = _expandedGames.size > 0 && sections.length > 0 && _expandedGames.size >= sections.length;
+  btn.textContent = allExpanded ? 'Collapse All' : 'Expand All';
+}
+
 function renderGames(data) {
   const container = document.getElementById('gamesContainer');
   container.innerHTML = '';
@@ -2348,8 +2389,10 @@ function renderGames(data) {
       if (!hasActiveMarket && !hasPositions && !hasRisked) return;
     }
 
+    const gameKey = game.game;
     const sec = document.createElement('div');
-    sec.className = 'game-section';
+    sec.className = 'game-section' + (_expandedGames.has(gameKey) ? ' expanded' : '');
+    sec.setAttribute('data-game', gameKey);
 
     const isTennis = (game.sport||'cbb') === 'tennis';
     const typeLabel = isTennis ? 'MATCH' : 'GAME';
@@ -2358,7 +2401,8 @@ function renderGames(data) {
     const scorePart = (!isTennis && game.score_display) ? '<span style="color:var(--white);font-size:14px;font-weight:bold;">'+game.score_display+'</span> <span style="color:var(--text2);font-size:12px;">'+( game.clock_display||'')+'</span> &nbsp; ' : '';
     const sportBadge = isTennis ? '<span class="tag" style="background:#1a3a1a;color:#3fb950;margin-right:6px;">TENNIS</span>' : '';
 
-    let html = '<div class="game-header"><span class="title">'+sportBadge+typeLabel+': '+game.game+'</span>';
+    let html = '<div class="game-header" onclick="toggleGame(\''+gameKey.replace(/'/g,"\\'")+'\')">';
+    html += '<span class="title"><span class="chevron">&#9654;</span>'+sportBadge+typeLabel+': '+game.game+'</span>';
     const metaParts = [scorePart, 'Progress: '+progress];
     if (!isTennis) metaParts.push('ESPN WP: '+wp);
     html += '<span class="meta">'+metaParts.join(' &nbsp; ')+'</span></div>';
@@ -2385,7 +2429,13 @@ function renderGames(data) {
       html += '<td class="'+pnlClass(tickTotal)+'" title="'+fmtCents(tickTotal)+' on '+fmtRisked(risked)+' risked"><b>'+fmtPct(tickTotal,risked)+'</b></td>';
       html += '</tr>';
     });
+    html += '</table>';
 
+    // === COLLAPSIBLE DETAILS SECTION ===
+    html += '<div class="game-details">';
+
+    // Subtotals table
+    html += '<table style="margin-top:6px;">';
     // ML subtotal row
     const mlPnl = game.ml_pnl || {realized:0, unrealized:0, total:0, risked:0};
     html += '<tr style="border-top:2px solid #1f3a5f;background:#0d1a2d;">';
@@ -2412,7 +2462,6 @@ function renderGames(data) {
     html += '<td></td><td></td>';
     html += '<td class="'+pnlClass(gameTotal)+'"><b>'+fmtPct(gameTotal,gameRisked)+' ('+fmtCents(gameTotal)+')</b></td>';
     html += '</tr>';
-
     html += '</table>';
 
     // Per-ticker strategy charts (RA for tennis, MR for CBB)
@@ -2496,9 +2545,12 @@ function renderGames(data) {
       html += '</div>';
     }
 
+    html += '</div>'; // close game-details
+
     sec.innerHTML = html;
     container.appendChild(sec);
   });
+  updateToggleAllBtn();
 }
 
 // ─── DATA FETCHING ───
