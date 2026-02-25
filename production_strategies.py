@@ -1549,14 +1549,18 @@ class RollingAverageStrategy(BaseStrategy):
                 return True, "timeout", max(1, int(no_bid) - 1), \
                     f"dir_flatten:{int(secs_to_close)}s"
 
-        # 3. Signal reversal (primary exit — matches backtest behavior)
-        if self._current_signal is not None and self._current_signal != position.side:
+        # 3. Signal lost or reversed → exit (exit-on-neutral mode)
+        #    Exit when the signal is no longer our entry side — either it
+        #    went to None (gold crossed back over the threshold band) or
+        #    flipped to the opposite side.  This cuts losers earlier instead
+        #    of waiting for a full reversal that rarely comes.
+        if self._current_signal != position.side:
+            reason = "signal_neutral" if self._current_signal is None else "signal_reversal"
+            detail = f"{reason}:{position.side}→{self._current_signal}"
             if position.side == "yes":
-                return True, "revert", max(1, int(yes_bid) - 1), \
-                    f"signal_reversal:{position.side}→{self._current_signal}"
+                return True, "revert", max(1, int(yes_bid) - 1), detail
             elif no_bid is not None:
-                return True, "revert", max(1, int(no_bid) - 1), \
-                    f"signal_reversal:{position.side}→{self._current_signal}"
+                return True, "revert", max(1, int(no_bid) - 1), detail
 
         # 4. Profit defense (trailing stop)
         activate = float(self.params.get("profit_defense_activate_cents", 8.0))
