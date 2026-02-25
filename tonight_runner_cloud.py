@@ -240,18 +240,27 @@ class R2Uploader:
         return uploaded
 
     CONFIG_R2_KEY = "kalshi/config/strategy_config.json"
+    MATCHES_R2_KEY = "kalshi/config/tennis_matches.json"
 
     def download_config(self, local_path: Path) -> bool:
         """Download strategy_config.json from R2 if content changed. Returns True if file was updated."""
+        return self._download_r2_file(self.CONFIG_R2_KEY, local_path, "Config")
+
+    def download_matches(self, local_path: Path) -> bool:
+        """Download tennis_matches.json from R2 if content changed. Returns True if file was updated."""
+        return self._download_r2_file(self.MATCHES_R2_KEY, local_path, "Matches")
+
+    def _download_r2_file(self, r2_key: str, local_path: Path, label: str) -> bool:
+        """Generic R2 file download with change detection."""
         if not self.enabled():
             return False
         try:
-            resp = self._client.get_object(Bucket=self.bucket, Key=self.CONFIG_R2_KEY)
+            resp = self._client.get_object(Bucket=self.bucket, Key=r2_key)
             data = resp["Body"].read()
         except Exception as e:
             if "NoSuchKey" in str(type(e).__name__) or "NoSuchKey" in str(e):
                 return False
-            print_status(f"[R2] download_config error: {e}")
+            print_status(f"[R2] download_{label.lower()} error: {e}")
             return False
 
         new_hash = hashlib.sha256(data).hexdigest()
@@ -261,7 +270,7 @@ class R2Uploader:
                 return False
 
         local_path.write_bytes(data)
-        print_status(f"[R2] Config updated: {local_path}")
+        print_status(f"[R2] {label} updated: {local_path}")
         return True
 
     def write_index(self, extra: Optional[Dict[str, Any]] = None) -> None:
@@ -709,6 +718,7 @@ def uploader_loop(stop: StopFlag, uploader: R2Uploader, interval_secs: int = 20)
     while not stop.is_set():
         try:
             uploader.download_config(Path("strategy_config.json"))
+            uploader.download_matches(Path("tennis_matches.json"))
             uploader.write_index()
             uploader.upload_changed()
         except Exception as e:

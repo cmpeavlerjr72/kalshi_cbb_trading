@@ -58,6 +58,34 @@ def calc_taker_fee(price_cents: int, qty: int = 1) -> float:
     return fee_per * qty * 100
 
 
+# =============================================================================
+# MA HELPER FUNCTIONS (for RollingAverageStrategy)
+# =============================================================================
+
+def calc_sma(values, window):
+    """Simple Moving Average of the last `window` values."""
+    if len(values) < window:
+        return None
+    return sum(values[-window:]) / window
+
+
+def calc_ema_tick(prev_ema, price, alpha):
+    """Single EMA update."""
+    if prev_ema is None:
+        return price
+    return alpha * price + (1 - alpha) * prev_ema
+
+
+def calc_tma(sma_series, half_window):
+    """Triangular MA = SMA of SMA values. Needs a running SMA series."""
+    if len(sma_series) < half_window:
+        return None
+    recent = sma_series[-half_window:]
+    if None in recent:
+        return None
+    return sum(recent) / half_window
+
+
 
 # =============================================================================
 # MARKET QUALITY FILTER (P3)
@@ -1252,6 +1280,329 @@ class PairedMeanReversionStrategy(BaseStrategy):
                     return True, "take_profit", max(1, int(no_bid) - 1), f"unpaired_reverted:{pnl:.0f}c"
 
         return False, "", 0, "unpaired_hold"
+
+
+# =============================================================================
+# STRATEGY: ROLLING AVERAGE (MA crossover sniper)
+# =============================================================================
+
+class RollingAverageStrategy(BaseStrategy):
+    """
+    MA crossover strategy: trades when fast MA crosses slow MA by threshold cents.
+    Supports EMA/TMA, TMA/TMA, and Dual EMA flavors.
+
+    "Sniper" style: ~1 trade per game, high threshold filters noise.
+    Self-gates on spread (bypasses MarketQualityMonitor).
+    """
+
+    bypass_market_quality = True  # strategy does its own spread gating
+
+    def __init__(self, max_capital: float, preferred_side: Optional[str] = None,
+                 exposure_tracker: Optional["ExposureTracker"] = None):
+        params = {
+            # MA type and windows
+            "strategy_type": "ema_tma",   # "ema_tma" | "tma_tma" | "dual_ema"
+            "fast_window": 40,
+            "slow_window": 160,
+            "threshold_cents": 12,
+
+            # Self-gating
+            "spread_max": 6,
+
+            # Position limits
+            "max_positions": 1,
+            "min_entry_gap_secs": 8,
+            "side_cooldown_secs": 0,
+            "stop_trading_before_close_secs": 0,
+
+            # Sizing
+            "entry_frac": 0.50,
+            "min_qty": 3,
+            "max_order_qty": 200,
+
+            # Profit defense (trailing stop)
+            "profit_defense_activate_cents": 8.0,
+            "profit_defense_giveback_frac": 0.40,
+            "profit_defense_min_keep_cents": 2.0,
+
+            # Near-close flatten
+            "flatten_before_close_secs": 120,
+
+            # Late-game directional filter
+            "directional_close_secs": 300,
+        }
+        super().__init__("rolling_avg", max_capital, params)
+
+        self.exposure_tracker = exposure_tracker
+
+        if preferred_side is not None:
+            preferred_side = preferred_side.lower().strip()
+            if preferred_side not in ("yes", "no"):
+                preferred_side = None
+        self.preferred_side = preferred_side
+
+        # MA state
+        self._mids: List[float] = []
+        self._tick = 0
+
+        # EMA state
+        self._fast_alpha = 2.0 / (params["fast_window"] + 1)
+        self._slow_alpha = 2.0 / (params["slow_window"] + 1)
+        self._ema_fast: Optional[float] = None
+        self._ema_slow: Optional[float] = None
+
+        # TMA state (SMA series for TMA computation)
+        self._sma_fast_series: List[Optional[float]] = []
+        self._sma_slow_series: List[Optional[float]] = []
+
+        # Signal tracking (matches backtest's last_signal behavior)
+        self._current_signal: Optional[str] = None  # "yes" | "no" | None
+        self._last_acted_signal: Optional[str] = None
+        self._pending_signal_change = False
+
+    def _warmup_ticks(self) -> int:
+        """Minimum ticks before signals are valid."""
+        st = self.params.get("strategy_type", "ema_tma")
+        fw = int(self.params.get("fast_window", 40))
+        sw = int(self.params.get("slow_window", 160))
+        if st == "ema_tma":
+            half = max(2, sw // 2)
+            return sw + half
+        elif st == "tma_tma":
+            slow_half = max(2, sw // 2)
+            return sw + slow_half
+        else:  # dual_ema
+            return sw
+
+    def _compute_signal(self) -> Optional[str]:
+        """Compute current signal from MA state. Returns 'yes', 'no', or None."""
+        if self._tick < self._warmup_ticks():
+            return None
+
+        threshold = float(self.params.get("threshold_cents", 12))
+        st = self.params.get("strategy_type", "ema_tma")
+
+        if st == "ema_tma":
+            fast_val = self._ema_fast
+            sw = int(self.params.get("slow_window", 160))
+            half = max(2, sw // 2)
+            slow_val = calc_tma(self._sma_slow_series, half)
+            if fast_val is None or slow_val is None:
+                return None
+            if fast_val > slow_val + threshold:
+                return "yes"
+            elif fast_val < slow_val - threshold:
+                return "no"
+
+        elif st == "tma_tma":
+            fw = int(self.params.get("fast_window", 40))
+            sw = int(self.params.get("slow_window", 160))
+            fast_half = max(2, fw // 2)
+            slow_half = max(2, sw // 2)
+            fast_val = calc_tma(self._sma_fast_series, fast_half)
+            slow_val = calc_tma(self._sma_slow_series, slow_half)
+            if fast_val is None or slow_val is None:
+                return None
+            if fast_val > slow_val + threshold:
+                return "yes"
+            elif fast_val < slow_val - threshold:
+                return "no"
+
+        else:  # dual_ema
+            if self._ema_fast is None or self._ema_slow is None:
+                return None
+            if self._ema_fast > self._ema_slow + threshold:
+                return "yes"
+            elif self._ema_fast < self._ema_slow - threshold:
+                return "no"
+
+        return None
+
+    def feed_price(self, mid: float):
+        """Called every 3s tick. Updates all MA state and tracks signal changes."""
+        self._tick += 1
+        self._mids.append(mid)
+
+        fw = int(self.params.get("fast_window", 40))
+        sw = int(self.params.get("slow_window", 160))
+
+        # Update EMA state (used by ema_tma and dual_ema)
+        self._ema_fast = calc_ema_tick(self._ema_fast, mid, self._fast_alpha)
+        self._ema_slow = calc_ema_tick(self._ema_slow, mid, self._slow_alpha)
+
+        # Update SMA series for TMA computation
+        sma_fast = calc_sma(self._mids, fw)
+        sma_slow = calc_sma(self._mids, sw)
+        self._sma_fast_series.append(sma_fast)
+        self._sma_slow_series.append(sma_slow)
+
+        # Compute signal and check for changes
+        new_signal = self._compute_signal()
+
+        if new_signal is not None and new_signal != self._current_signal:
+            self._current_signal = new_signal
+            if new_signal != self._last_acted_signal:
+                self._pending_signal_change = True
+        elif new_signal is None:
+            self._current_signal = new_signal
+
+        # Bound memory for very long games
+        max_keep = sw * 3
+        if len(self._mids) > max_keep:
+            self._mids = self._mids[-sw * 2:]
+        if len(self._sma_fast_series) > max_keep:
+            self._sma_fast_series = self._sma_fast_series[-sw * 2:]
+        if len(self._sma_slow_series) > max_keep:
+            self._sma_slow_series = self._sma_slow_series[-sw * 2:]
+
+    def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
+        yes_ask = prices.get("imp_yes_ask")
+        no_ask = prices.get("imp_no_ask")
+        yes_bid = prices.get("best_yes_bid")
+
+        if yes_ask is None or yes_bid is None:
+            return False, "", 0, 0, "no_prices"
+
+        # Self-gate on spread
+        spread = int(yes_ask) - int(yes_bid) if yes_bid else 99
+        spread_max = int(self.params.get("spread_max", 6))
+        if spread > spread_max:
+            return False, "", 0, 0, f"spread:{spread}>{spread_max}"
+
+        # Check for pending signal change
+        if not self._pending_signal_change:
+            return False, "", 0, 0, "no_signal"
+
+        signal = self._current_signal
+        if signal is None:
+            return False, "", 0, 0, "no_signal"
+
+        # Directional late-game filter
+        dir_secs = int(self.params.get("directional_close_secs", 300))
+        if (secs_to_close <= dir_secs and self.preferred_side in ("yes", "no")
+                and signal != self.preferred_side):
+            return False, "", 0, 0, f"dir_block:{signal}_vs_pref_{self.preferred_side}"
+
+        # Determine side and price
+        if signal == "yes":
+            entry_price = int(yes_ask)
+        else:
+            if no_ask is None:
+                return False, "", 0, 0, "no_no_ask"
+            entry_price = int(no_ask)
+
+        # Size qty
+        remaining = max(0.0, float(self.max_capital) - float(self.capital_used))
+        per = entry_price / 100.0
+        if per <= 0:
+            return False, "", 0, 0, "no_capital"
+        max_possible = int(remaining / per)
+
+        entry_frac = float(self.params.get("entry_frac", 0.50))
+        min_qty = int(self.params.get("min_qty", 3))
+        max_qty = int(self.params.get("max_order_qty", 200))
+
+        qty = max(int(max_possible * entry_frac), min(min_qty, max_possible))
+        qty = min(qty, max_qty, max_possible)
+        if qty <= 0:
+            return False, "", 0, 0, "no_capital"
+
+        # Check exposure tracker
+        if self.exposure_tracker:
+            cost = entry_price * qty / 100.0
+            if not self.exposure_tracker.try_reserve(cost):
+                return False, "", 0, 0, "exposure_limit"
+
+        # Mark signal as acted on
+        self._pending_signal_change = False
+        self._last_acted_signal = signal
+
+        warmup = self._warmup_ticks()
+        return True, signal, entry_price, qty, \
+            f"ra_{signal}:tick={self._tick},warmup={warmup},spread={spread}"
+
+    def evaluate_exit(self, position, prices, secs_to_close, context) -> Tuple[bool, str, int, str]:
+        yes_bid = prices.get("best_yes_bid")
+        no_bid = prices.get("best_no_bid")
+
+        if yes_bid is None:
+            return False, "", 0, "no_bid"
+
+        # 1. Near-close flatten
+        flatten_secs = int(self.params.get("flatten_before_close_secs", 120))
+        if secs_to_close <= flatten_secs:
+            if position.side == "yes":
+                return True, "timeout", max(1, int(yes_bid) - 1), \
+                    f"near_close_flatten:{int(secs_to_close)}s"
+            elif no_bid is not None:
+                return True, "timeout", max(1, int(no_bid) - 1), \
+                    f"near_close_flatten:{int(secs_to_close)}s"
+
+        # 2. Directional wrong-side flatten (last 300s)
+        dir_secs = int(self.params.get("directional_close_secs", 300))
+        if (secs_to_close <= dir_secs and self.preferred_side in ("yes", "no")
+                and position.side != self.preferred_side):
+            if position.side == "yes":
+                return True, "timeout", max(1, int(yes_bid) - 1), \
+                    f"dir_flatten:{int(secs_to_close)}s"
+            elif no_bid is not None:
+                return True, "timeout", max(1, int(no_bid) - 1), \
+                    f"dir_flatten:{int(secs_to_close)}s"
+
+        # 3. Signal reversal (primary exit — matches backtest behavior)
+        if self._current_signal is not None and self._current_signal != position.side:
+            if position.side == "yes":
+                return True, "revert", max(1, int(yes_bid) - 1), \
+                    f"signal_reversal:{position.side}→{self._current_signal}"
+            elif no_bid is not None:
+                return True, "revert", max(1, int(no_bid) - 1), \
+                    f"signal_reversal:{position.side}→{self._current_signal}"
+
+        # 4. Profit defense (trailing stop)
+        activate = float(self.params.get("profit_defense_activate_cents", 8.0))
+        giveback_frac = float(self.params.get("profit_defense_giveback_frac", 0.40))
+        min_keep = float(self.params.get("profit_defense_min_keep_cents", 2.0))
+
+        if position.side == "yes":
+            pnl = float(yes_bid) - float(position.entry_price)
+            if pnl > position.max_fav_pnl_cents:
+                position.max_fav_pnl_cents = pnl
+                position.max_fav_ts = utc_now().isoformat()
+            if position.max_fav_pnl_cents >= activate:
+                floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
+                if pnl <= max(min_keep, floor):
+                    return True, "profit_defense", max(1, int(yes_bid) - 1), \
+                        f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c"
+        else:
+            if no_bid is not None:
+                pnl = float(no_bid) - float(position.entry_price)
+                if pnl > position.max_fav_pnl_cents:
+                    position.max_fav_pnl_cents = pnl
+                    position.max_fav_ts = utc_now().isoformat()
+                if position.max_fav_pnl_cents >= activate:
+                    floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
+                    if pnl <= max(min_keep, floor):
+                        return True, "profit_defense", max(1, int(no_bid) - 1), \
+                            f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c"
+
+        return False, "", 0, "hold"
+
+    def update_params(self, overrides: dict):
+        """Override to recalculate EMA alphas when windows change."""
+        super().update_params(overrides)
+
+        # Recalculate EMA alphas if windows changed
+        if "fast_window" in overrides or "slow_window" in overrides:
+            fw = int(self.params.get("fast_window", 40))
+            sw = int(self.params.get("slow_window", 160))
+            self._fast_alpha = 2.0 / (fw + 1)
+            self._slow_alpha = 2.0 / (sw + 1)
+
+        # If strategy_type changed, reset signal state
+        if "strategy_type" in overrides:
+            self._current_signal = None
+            self._last_acted_signal = None
+            self._pending_signal_change = False
 
 
 # =============================================================================

@@ -1,15 +1,17 @@
 # tennis_runner.py
-# ATP Tennis match runner — mirrors tonight_runner_cloud.py for CBB
+# ATP Tennis match runner — Rolling Average (MA crossover) strategy
 #
 # Differences from CBB runner:
 #   - No ESPN clock (tennis doesn't have reliable free live score APIs with win prob)
 #   - Uses Kalshi close_time as sole clock source
 #   - Market discovery via KXATPMATCH series
 #   - Matches configured with player codes instead of team codes
+#   - RA-only strategy (no MR) — data collection phase
 #
 # Usage:
 #   python tennis_runner.py                          # uses MATCHES list below
-#   python tennis_runner.py --bundle todays_tennis_bundle.json  # from bundle
+#   python tennis_runner.py --matches-json tennis_matches.json
+#   python tennis_runner.py --cloud                  # cloud mode with R2 sync
 #
 # Env vars (same as CBB):
 #   KALSHI_ENV=PROD|DEMO
@@ -46,7 +48,7 @@ from combo_vnext import (
 )
 
 from production_strategies import (
-    MeanReversionStrategy,
+    RollingAverageStrategy,
     ExposureTracker,
     GameRunner,
 )
@@ -59,39 +61,38 @@ import re
 
 TENNIS_SERIES = ["KXATPMATCH", "KXATPCHALLENGERMATCH", "KXWTAMATCH"]
 
-# Today's matches — edit before running
+MATCHES_JSON_FILE = REPO_ROOT / "tennis_matches.json"
+
+# Tennis-optimal RA params from grid search (EMA/TMA 40/160 t=12)
+TENNIS_RA_OVERRIDES = {
+    "strategy_type": "ema_tma",
+    "fast_window": 40,
+    "slow_window": 160,
+    "threshold_cents": 12,
+    "spread_max": 6,
+    "max_positions": 1,
+    "entry_frac": 0.50,
+    "min_qty": 3,
+    "max_order_qty": 200,
+    "profit_defense_activate_cents": 8.0,
+    "profit_defense_giveback_frac": 0.40,
+    "profit_defense_min_keep_cents": 2.0,
+    "flatten_before_close_secs": 120,
+    "directional_close_secs": 300,
+}
+
+# Today's matches — fallback if tennis_matches.json not found
 # player_code must match the Kalshi ticker suffix (e.g. "POP", "RUB", "MEN")
 MATCHES = [
-    {
-        "label": "Tabilo vs Barrios Vera",
-        "player_code": "TAB",
-        "opponent_code": "BAR",
-        "match_key": "26FEB22TABBAR",
-        "model_p_win": 0.50,
-    },
-    {
-        "label": "Yuan vs Sramkova",
-        "player_code": "YUA",
-        "opponent_code": "SRA",
-        "match_key": "26FEB24YUASRA",
-        "series": "KXWTAMATCH",
-        "model_p_win": 0.50,
-    },
-    {
-        "label": "Frech vs Timofeeva",
-        "player_code": "FRE",
-        "opponent_code": "TIM",
-        "match_key": "26FEB24FRETIM",
-        "series": "KXWTAMATCH",
-        "model_p_win": 0.50,
-    },
-    {
-        "label": "Duckworth vs Svrcina",
-        "player_code": "DUC",
-        "opponent_code": "SVR",
-        "match_key": "26FEB22DUCSVR",
-        "model_p_win": 0.50,
-    },
+    {"label": "Rublev vs Humbert", "player_code": "RUB", "opponent_code": "HUM", "match_key": "26FEB25RUBHUM", "model_p_win": 0.50},
+    {"label": "Blanchet vs Broom", "player_code": "BLA", "opponent_code": "BRO", "match_key": "26FEB25BLABRO", "series": "KXATPCHALLENGERMATCH", "model_p_win": 0.50},
+    {"label": "Budkov Kjaer vs Nes", "player_code": "BUD", "opponent_code": "NES", "match_key": "26FEB25BUDNES", "series": "KXATPCHALLENGERMATCH", "model_p_win": 0.50},
+    {"label": "Martineau vs Torra", "player_code": "MAR", "opponent_code": "TOR", "match_key": "26FEB25MARTOR", "series": "KXATPCHALLENGERMATCH", "model_p_win": 0.50},
+    {"label": "Mensik vs Popyrin", "player_code": "MEN", "opponent_code": "POP", "match_key": "26FEB25MENPOP", "model_p_win": 0.50},
+    {"label": "Ugo vs Hanfmann", "player_code": "UGO", "opponent_code": "HAN", "match_key": "26FEB24UGOHAN", "model_p_win": 0.50},
+    {"label": "Rindknecht vs Draper", "player_code": "RIN", "opponent_code": "DRA", "match_key": "26FEB25RINDRA", "model_p_win": 0.50},
+    {"label": "Mrva vs Moro", "player_code": "MRV", "opponent_code": "MMO", "match_key": "26FEB25MRVMMO", "series": "KXATPCHALLENGERMATCH", "model_p_win": 0.50},
+    {"label": "Koueladjol vs Droguet", "player_code": "KOU", "opponent_code": "DRO", "match_key": "26FEB22KOUDRO", "series": "KXATPCHALLENGERMATCH", "model_p_win": 0.50},
 ]
 
 
@@ -251,51 +252,30 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
         except Exception as e:
             print_status(f"[{label}] Warning: failed to load strategy_config.json: {e}")
 
-        # Strategy: MR-only with tennis-specific tuning
-        #
-        # Tennis vs CBB differences that affect MR:
-        #  - Prices move in step-functions (flat during holds, jumps on breaks/sets)
-        #    → shorter lookback so the mean tracks regime shifts faster
-        #  - No ESPN clock gating → lower warmup to start trading sooner
-        #  - Baseline volatility is spikier (break points can move 10-15c instantly)
-        #    → wider std multipliers to avoid over-triggering on normal tennis swings
-        #  - Capital split across 7+ matches vs 3-4 CBB games
-        #    → fewer max positions per match
-        TENNIS_MR_OVERRIDES = {
-            "lookback": 80,              # 80 samples (~4 min) vs CBB 120 (~6 min)
-            "warmup_samples": 80,        # faster warmup (no ESPN gate)
-            "max_positions": 3,          # fewer positions per match (more matches running)
-            "high_vol_std_mult": 2.0,    # wider threshold (tennis spikes are normal)
-            "low_vol_std_mult": 3.0,     # wider low-vol threshold
-            "dead_lookback": 50,         # 50 samples (~2.5 min) — tennis has longer flat
-                                         # stretches during service holds before big jumps
-            "dead_min_move": 2.0,        # 2c vs CBB 3c — more tolerant of quiet periods
-            "revert_min_cents": 4.0,     # 4c vs CBB 2c — hold for bigger reversion;
-                                         # tennis swings are larger so 2c bounce is noise
-            "mean_shift_exit_cents": 5.0,  # 5c vs CBB 3c — shorter lookback makes mean
-                                         # drift faster, so raise the "thesis collapsed"
-                                         # threshold to avoid premature exits
-        }
-
+        # Strategy: RA-only (Rolling Average / MA crossover)
+        # 100% allocation to RA — no MR for this test run
         strategies = [
-            MeanReversionStrategy(
+            RollingAverageStrategy(
                 max_capital=allocation,
                 preferred_side=preferred_side,
                 exposure_tracker=exposure,
             ),
         ]
 
-        # Apply tennis defaults, then strategy_config.json overrides on top
+        # Apply tennis RA defaults, then strategy_config.json overrides on top
         for strat in strategies:
-            strat.update_params(TENNIS_MR_OVERRIDES)
+            strat.update_params(TENNIS_RA_OVERRIDES)
             overrides = strategy_config_overrides.get(strat.name, {})
             if overrides:
                 strat.update_params(overrides)
 
+        st = strat.params.get("strategy_type", "ema_tma")
+        fw = strat.params.get("fast_window", 40)
+        sw = strat.params.get("slow_window", 160)
+        tc = strat.params.get("threshold_cents", 12)
         print_status(
-            f"[{label}] MR:${allocation:.2f} | "
-            f"Preferred:{preferred_side.upper()} | "
-            f"Maker entries + MP20"
+            f"[{label}] RA:{st} {fw}/{sw} t={tc} | ${allocation:.2f} | "
+            f"Preferred:{preferred_side.upper()} | Maker entries + MP20"
         )
 
         # Run GameRunner (no ESPN clock — tennis uses Kalshi close time only)
@@ -315,7 +295,7 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
                 "spread_max": 10.0,  # tennis books are naturally thinner
                 "range_min": 3.0,    # smaller range still valid
             },
-            base_strategy_overrides={"mean_reversion": TENNIS_MR_OVERRIDES},
+            base_strategy_overrides={"rolling_avg": TENNIS_RA_OVERRIDES},
         )
 
         summary = runner.run()
@@ -348,7 +328,7 @@ def _load_cloud_helpers():
 def load_matches_from_env() -> Optional[List[Dict[str, Any]]]:
     """
     Load matches from env vars (cloud mode).
-    Priority: MATCHES_JSON (inline) → MATCHES_JSON_PATH (file path)
+    Priority: MATCHES_JSON (inline) -> MATCHES_JSON_PATH (file path)
     """
     inline = os.getenv("MATCHES_JSON", "").strip()
     if inline:
@@ -375,12 +355,79 @@ def load_matches_from_env() -> Optional[List[Dict[str, Any]]]:
     return None
 
 
+def load_matches_from_file() -> Optional[List[Dict[str, Any]]]:
+    """Load matches from tennis_matches.json (local or R2-synced)."""
+    for path in [MATCHES_JSON_FILE, Path("tennis_matches.json")]:
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, list) and data:
+                    return data
+            except Exception:
+                pass
+    return None
+
+
+# ============================================================================
+# MATCH WATCHER — hot-add new matches mid-session
+# ============================================================================
+
+def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
+                       results: Dict[str, Any], threads: List[threading.Thread],
+                       private_key_path: str, bundle: Optional[Dict[str, Any]],
+                       cloud_mode: bool, balance_per_match: float,
+                       stop_event: Optional[Any] = None):
+    """
+    Periodically re-reads tennis_matches.json and launches threads for new matches.
+    Runs in main thread or as a daemon thread.
+    """
+    check_interval = 60  # seconds
+    while True:
+        if stop_event and stop_event.is_set():
+            break
+        time.sleep(check_interval)
+
+        try:
+            new_matches = load_matches_from_file()
+            if not new_matches:
+                continue
+
+            with running_keys_lock:
+                for m in new_matches:
+                    mk = m.get("match_key", m.get("label", ""))
+                    if mk in running_keys:
+                        continue
+
+                    # New match found — launch thread
+                    running_keys.add(mk)
+                    m["allocation"] = float(m.get("allocation") or balance_per_match)
+
+                    try:
+                        match_pk = _load_private_key(private_key_path)
+                    except Exception as e:
+                        print_status(f"[WATCHER] Key error for {m.get('label', '?')}: {e}")
+                        continue
+
+                    t = threading.Thread(
+                        target=run_match,
+                        args=(m, match_pk, results, bundle),
+                        name=m.get("label", mk),
+                        daemon=False,
+                    )
+                    t.start()
+                    threads.append(t)
+                    print_status(f"[WATCHER] Hot-added: {m.get('label', mk)} (alloc=${m['allocation']:.2f})")
+
+        except Exception as e:
+            print_status(f"[WATCHER] Error: {e}")
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="ATP Tennis match runner for Kalshi")
+    ap = argparse.ArgumentParser(description="ATP Tennis match runner for Kalshi (RA strategy)")
     ap.add_argument("--bundle", default="", help="Path to todays_tennis_bundle.json (optional)")
     ap.add_argument("--matches-json", default="", help="Path to matches config JSON (optional)")
     ap.add_argument("--cloud", action="store_true", help="Cloud/worker mode: R2 sync, no interactive prompt")
@@ -394,8 +441,9 @@ def main() -> int:
         setup_workdir()
 
     print("\n" + "=" * 80)
-    print("  ATP TENNIS RUNNER — MR-ONLY + MAKER ENTRIES + MP20")
+    print("  ATP TENNIS RUNNER — RA-ONLY (EMA/TMA crossover) + MAKER ENTRIES + MP20")
     print("  No ESPN clock — using Kalshi close time only")
+    print("  Strategy: Rolling Average sniper (~1 trade/game)")
     if cloud_mode:
         print("  MODE: CLOUD (R2 sync enabled)")
     print("=" * 80)
@@ -448,9 +496,16 @@ def main() -> int:
             print_status(f"Matches JSON not found: {args.matches_json}")
             return 1
 
+    # Try tennis_matches.json file
+    if matches is None:
+        matches = load_matches_from_file()
+        if matches:
+            print_status(f"Loaded {len(matches)} matches from tennis_matches.json")
+
     # Fallback to hardcoded MATCHES
     if matches is None:
         matches = list(MATCHES)
+        print_status(f"Using {len(matches)} hardcoded matches")
 
     # Load bundle if provided
     bundle = None
@@ -531,7 +586,14 @@ def main() -> int:
 
     key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip()
 
+    # Track running match keys for hot-add watcher
+    running_keys: set = set()
+    running_keys_lock = threading.Lock()
+
     for match in matches:
+        mk = match.get("match_key", match.get("label", ""))
+        running_keys.add(mk)
+
         match_pk = _load_private_key(key_path)
         t = threading.Thread(
             target=run_match,
@@ -542,6 +604,17 @@ def main() -> int:
         t.start()
         threads.append(t)
         print_status(f"Started: {match['label']}")
+
+    # --- Start match watcher (hot-add new matches from tennis_matches.json) ---
+    watcher_thread = threading.Thread(
+        target=match_watcher_loop,
+        args=(running_keys, running_keys_lock, results, threads,
+              key_path, bundle, cloud_mode, per_match_allocation, stop),
+        name="match_watcher",
+        daemon=True,
+    )
+    watcher_thread.start()
+    print_status("[WATCHER] Match watcher started (checks every 60s for new matches)")
 
     # --- Wait for threads ---
     if cloud_mode and stop:
@@ -603,6 +676,7 @@ def main() -> int:
         agg_path = LOG_ROOT / f"tennis_aggregate_summary_{ts}.json"
         agg = {
             "sport": "tennis",
+            "strategy": "rolling_avg",
             "updated_utc": utc_now().isoformat(),
             "portfolio_net_cents": total_net,
             "results": results,
