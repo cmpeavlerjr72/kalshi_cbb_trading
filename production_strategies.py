@@ -1528,14 +1528,18 @@ class RollingAverageStrategy(BaseStrategy):
         if yes_bid is None:
             return False, "", 0, "no_bid"
 
+        # Effective NO bid — use implied value from YES side when NO book is empty.
+        # This prevents all NO-side exits from silently failing in thin markets.
+        eff_no_bid = int(no_bid) if no_bid is not None else max(1, 99 - int(yes_bid))
+
         # 1. Near-close flatten
         flatten_secs = int(self.params.get("flatten_before_close_secs", 120))
         if secs_to_close <= flatten_secs:
             if position.side == "yes":
                 return True, "timeout", max(1, int(yes_bid) - 1), \
                     f"near_close_flatten:{int(secs_to_close)}s"
-            elif no_bid is not None:
-                return True, "timeout", max(1, int(no_bid) - 1), \
+            else:
+                return True, "timeout", max(1, eff_no_bid - 1), \
                     f"near_close_flatten:{int(secs_to_close)}s"
 
         # 2. Directional wrong-side flatten (last 300s)
@@ -1545,8 +1549,8 @@ class RollingAverageStrategy(BaseStrategy):
             if position.side == "yes":
                 return True, "timeout", max(1, int(yes_bid) - 1), \
                     f"dir_flatten:{int(secs_to_close)}s"
-            elif no_bid is not None:
-                return True, "timeout", max(1, int(no_bid) - 1), \
+            else:
+                return True, "timeout", max(1, eff_no_bid - 1), \
                     f"dir_flatten:{int(secs_to_close)}s"
 
         # 3. Signal lost or reversed → exit (exit-on-neutral mode)
@@ -1559,8 +1563,8 @@ class RollingAverageStrategy(BaseStrategy):
             detail = f"{reason}:{position.side}→{self._current_signal}"
             if position.side == "yes":
                 return True, "revert", max(1, int(yes_bid) - 1), detail
-            elif no_bid is not None:
-                return True, "revert", max(1, int(no_bid) - 1), detail
+            else:
+                return True, "revert", max(1, eff_no_bid - 1), detail
 
         # 4. Profit defense (trailing stop)
         activate = float(self.params.get("profit_defense_activate_cents", 8.0))
@@ -1578,16 +1582,15 @@ class RollingAverageStrategy(BaseStrategy):
                     return True, "profit_defense", max(1, int(yes_bid) - 1), \
                         f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c"
         else:
-            if no_bid is not None:
-                pnl = float(no_bid) - float(position.entry_price)
-                if pnl > position.max_fav_pnl_cents:
-                    position.max_fav_pnl_cents = pnl
-                    position.max_fav_ts = utc_now().isoformat()
-                if position.max_fav_pnl_cents >= activate:
-                    floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
-                    if pnl <= max(min_keep, floor):
-                        return True, "profit_defense", max(1, int(no_bid) - 1), \
-                            f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c"
+            pnl = float(eff_no_bid) - float(position.entry_price)
+            if pnl > position.max_fav_pnl_cents:
+                position.max_fav_pnl_cents = pnl
+                position.max_fav_ts = utc_now().isoformat()
+            if position.max_fav_pnl_cents >= activate:
+                floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
+                if pnl <= max(min_keep, floor):
+                    return True, "profit_defense", max(1, eff_no_bid - 1), \
+                        f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c"
 
         return False, "", 0, "hold"
 
