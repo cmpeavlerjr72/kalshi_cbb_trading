@@ -2377,7 +2377,16 @@ function renderGames(data) {
 
   const hideInactive = document.getElementById('hideInactive').checked;
 
-  data.games.forEach(game => {
+  // Sort: games with open positions first, then by name
+  const sortedGames = [...data.games].sort((a, b) => {
+    const aPosCount = (a.open_positions||[]).length;
+    const bPosCount = (b.open_positions||[]).length;
+    if (aPosCount > 0 && bPosCount === 0) return -1;
+    if (aPosCount === 0 && bPosCount > 0) return 1;
+    return 0;
+  });
+
+  sortedGames.forEach(game => {
     // Skip inactive games: market settled/empty, no open positions, no capital risked
     if (hideInactive) {
       const hasActiveMarket = (game.tickers||[]).some(t => {
