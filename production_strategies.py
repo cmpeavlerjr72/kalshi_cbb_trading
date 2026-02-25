@@ -1986,6 +1986,13 @@ class GameRunner:
                 fresh_bid = px.get(bid_key)
                 fresh_ask = px.get(ask_key)
 
+                # Implied bid from opposite side when direct book is empty
+                if fresh_bid is None:
+                    opp_key = "best_yes_bid" if position.side == "no" else "best_no_bid"
+                    opp_bid = px.get(opp_key)
+                    if opp_bid is not None:
+                        fresh_bid = max(1, 99 - int(opp_bid))
+
                 if fresh_bid is None:
                     print_status(f"[{self.label}][{strategy.name}] MAKER EXIT SKIP — no bid")
                     self._log_event(strategy.name, "exit_skip_maker_nobid", f"{position.side}")
@@ -2021,6 +2028,14 @@ class GameRunner:
                     px = derive_prices(ob)
                     bid_key = "best_yes_bid" if position.side == "yes" else "best_no_bid"
                     fresh_bid = px.get(bid_key)
+
+                    # Implied bid from opposite side when direct book is empty
+                    if fresh_bid is None:
+                        opp_key = "best_yes_bid" if position.side == "no" else "best_no_bid"
+                        opp_bid = px.get(opp_key)
+                        if opp_bid is not None:
+                            fresh_bid = max(1, 99 - int(opp_bid))
+
                     if fresh_bid is None:
                         print_status(f"[{self.label}][{strategy.name}] EXIT NO BID — cannot sell")
                         self._log_event(strategy.name, "exit_nofill", f"{position.side} no_bid")
