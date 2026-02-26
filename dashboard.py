@@ -12,6 +12,7 @@ import os
 import io
 import csv
 import gc
+import gzip
 import json
 import time
 import threading
@@ -1523,8 +1524,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pass  # suppress default logging
 
     def _send_json(self, data, status=200):
-        body = json.dumps(data, default=str).encode("utf-8")
-        self.send_response(status)
+        raw = json.dumps(data, default=str).encode("utf-8")
+        # Gzip if client supports it and payload is worth compressing
+        accept_enc = self.headers.get("Accept-Encoding", "")
+        if "gzip" in accept_enc and len(raw) > 1024:
+            body = gzip.compress(raw, compresslevel=6)
+            self.send_response(status)
+            self.send_header("Content-Encoding", "gzip")
+        else:
+            body = raw
+            self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -1532,8 +1541,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_html(self, html: str):
-        body = html.encode("utf-8")
-        self.send_response(200)
+        raw = html.encode("utf-8")
+        accept_enc = self.headers.get("Accept-Encoding", "")
+        if "gzip" in accept_enc:
+            body = gzip.compress(raw, compresslevel=6)
+            self.send_response(200)
+            self.send_header("Content-Encoding", "gzip")
+        else:
+            body = raw
+            self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
