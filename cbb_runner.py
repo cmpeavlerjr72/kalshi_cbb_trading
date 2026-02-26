@@ -113,6 +113,7 @@ def build_game_log_dir(game_label: str, game_date: str) -> Path:
         LOG_ROOT
         / "kalshi"
         / "cbb"
+        / "ncaam"
         / game_date
         / safe_name(game_label)
     )
