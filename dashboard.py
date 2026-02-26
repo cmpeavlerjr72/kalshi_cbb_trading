@@ -11,6 +11,7 @@ and serves a live-updating dark-themed dashboard.
 import os
 import io
 import csv
+import gc
 import json
 import time
 import threading
@@ -108,8 +109,9 @@ def get_s3_client():
 # =============================================================================
 
 class R2Cache:
-    def __init__(self, ttl_secs: int = 15):
+    def __init__(self, ttl_secs: int = 15, max_entries: int = 200):
         self.ttl = ttl_secs
+        self.max_entries = max_entries
         self._store = {}  # key -> (timestamp, data)
         self._lock = threading.Lock()
 
@@ -123,6 +125,12 @@ class R2Cache:
     def put(self, key: str, data):
         with self._lock:
             self._store[key] = (time.time(), data)
+            # Evict expired entries periodically to prevent memory growth
+            if len(self._store) > self.max_entries:
+                now = time.time()
+                expired = [k for k, (ts, _) in self._store.items() if now - ts > self.ttl]
+                for k in expired:
+                    del self._store[k]
 
 
 _cache = R2Cache(ttl_secs=15)
@@ -1433,7 +1441,7 @@ def build_dashboard_data(date_str: str):
 # BACKGROUND DATA POLLER
 # =============================================================================
 
-_bg_data = {}       # date_str -> full dashboard payload
+_bg_data = {}       # date_str -> full dashboard payload (keep only active date)
 _bg_data_lock = threading.Lock()
 _bg_active_date = None  # date the poller is currently refreshing
 _bg_wake = threading.Event()  # signal poller to fetch immediately
@@ -1452,12 +1460,16 @@ def _bg_poller():
                 payload = build_dashboard_data(date_str)
                 elapsed = time.time() - t0
                 with _bg_data_lock:
+                    # Only keep the active date to prevent memory growth
+                    _bg_data.clear()
                     _bg_data[date_str] = payload
                 ng = len(payload.get("games", []))
                 _bg_status["state"] = "idle"
                 _bg_status["last_ok"] = f"{ng} games in {elapsed:.1f}s"
                 _bg_status["last_error"] = None
                 _bg_status["cycles"] += 1
+                # Force garbage collection to release intermediate data
+                gc.collect()
                 print(f"[poller] Refreshed {date_str}: {ng} games in {elapsed:.1f}s", flush=True)
             except Exception as e:
                 import traceback
