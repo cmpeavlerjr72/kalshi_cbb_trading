@@ -134,7 +134,7 @@ class R2Cache:
                     del self._store[k]
 
 
-_cache = R2Cache(ttl_secs=15)
+_cache = R2Cache(ttl_secs=15, max_entries=100)
 
 
 # =============================================================================
@@ -838,11 +838,12 @@ def safe_int(v, default=0):
         return default
 
 
-def fetch_csv_from_r2(key: str):
-    """Fetch a CSV file from R2, return list of dicts. Uses cache."""
-    cached = _cache.get(key)
-    if cached is not None:
-        return cached
+def fetch_csv_from_r2(key: str, skip_cache: bool = False):
+    """Fetch a CSV file from R2, return list of dicts. Uses cache unless skip_cache."""
+    if not skip_cache:
+        cached = _cache.get(key)
+        if cached is not None:
+            return cached
 
     try:
         s3 = get_s3_client()
@@ -850,7 +851,8 @@ def fetch_csv_from_r2(key: str):
         body = resp["Body"].read().decode("utf-8")
         reader = csv.DictReader(io.StringIO(body))
         rows = list(reader)
-        _cache.put(key, rows)
+        if not skip_cache:
+            _cache.put(key, rows)
         return rows
     except s3.exceptions.NoSuchKey:
         return []
@@ -1198,24 +1200,25 @@ def build_dashboard_data(date_str: str):
 
         for ticker_label in game_info["tickers"]:
             # Determine how to fetch CSVs based on format
+            # Snapshots skip cache — they're large and change every cycle
             if ticker_label == "_flat" and "flat_files" in game_info:
                 # Old flat format: individual R2 keys per file type
                 ff = game_info["flat_files"]
-                snapshots = fetch_csv_from_r2(ff["snapshots"]) if "snapshots" in ff else []
+                snapshots = fetch_csv_from_r2(ff["snapshots"], skip_cache=True) if "snapshots" in ff else []
                 trades = fetch_csv_from_r2(ff["trades"]) if "trades" in ff else []
                 positions = fetch_csv_from_r2(ff["positions"]) if "positions" in ff else []
                 events = fetch_csv_from_r2(ff["events"]) if "events" in ff else []
             elif ticker_label == "_root" and "prefix_override" in game_info:
                 # Old nested format: CSVs directly in game folder
                 csv_prefix = game_info["prefix_override"]
-                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv")
+                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv", skip_cache=True)
                 trades = fetch_csv_from_r2(f"{csv_prefix}/trades.csv")
                 positions = fetch_csv_from_r2(f"{csv_prefix}/positions.csv")
                 events = fetch_csv_from_r2(f"{csv_prefix}/events.csv")
             else:
                 # New format: ticker subfolder
                 csv_prefix = f"{game_info['prefix']}/{ticker_label}"
-                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv")
+                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv", skip_cache=True)
                 trades = fetch_csv_from_r2(f"{csv_prefix}/trades.csv")
                 positions = fetch_csv_from_r2(f"{csv_prefix}/positions.csv")
                 events = fetch_csv_from_r2(f"{csv_prefix}/events.csv")
@@ -1283,6 +1286,9 @@ def build_dashboard_data(date_str: str):
                     mr_signal = compute_mr_signal(snapshots, sport=game_sport)
             except Exception:
                 mr_signal = None
+
+            # Release snapshot data — it's the largest object per ticker
+            del snapshots
 
             ticker_data = {
                 "label": ticker_label,
