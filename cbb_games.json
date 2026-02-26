@@ -3,7 +3,7 @@
     "label": "Mercer at Western Carolina",
     "team_name": "MER",
     "game_key": "26FEB25MERWCU",
-    "espn_date": "20260226",
+    "espn_date": "20260225",
     "espn_team": "MER",
     "espn_opponent": "WCU",
     "model_p_win": 0.50
@@ -12,7 +12,7 @@
     "label": "Northern Kentucky at Cleveland St.",
     "team_name": "NKU",
     "game_key": "26FEB25NKUCLEV",
-    "espn_date": "20260226",
+    "espn_date": "20260225",
     "espn_team": "NKU",
     "espn_opponent": "CLEV",
     "model_p_win": 0.50
@@ -21,7 +21,7 @@
     "label": "Queens University at Eastern Kentucky",
     "team_name": "QUC",
     "game_key": "26FEB25QUCEKY",
-    "espn_date": "20260226",
+    "espn_date": "20260225",
     "espn_team": "QUC",
     "espn_opponent": "EKY",
     "model_p_win": 0.50
@@ -30,7 +30,7 @@
     "label": "East Carolina at UTSA",
     "team_name": "ECU",
     "game_key": "26FEB25ECUUTSA",
-    "espn_date": "20260226",
+    "espn_date": "20260225",
     "espn_team": "ECU",
     "espn_opponent": "UTSA",
     "model_p_win": 0.50
@@ -39,7 +39,7 @@
     "label": "Georgia Southern at James Madison",
     "team_name": "GASO",
     "game_key": "26FEB25GASOJMU",
-    "espn_date": "20260226",
+    "espn_date": "20260225",
     "espn_team": "GASO",
     "espn_opponent": "JMU",
     "model_p_win": 0.50
@@ -48,7 +48,7 @@
     "label": "Central Arkansas at Austin Peay",
     "team_name": "CARK",
     "game_key": "26FEB25CARKPEAY",
-    "espn_date": "20260226",
+    "espn_date": "20260225",
     "espn_team": "CARK",
     "espn_opponent": "PEAY",
     "model_p_win": 0.50
@@ -57,7 +57,7 @@
     "label": "Washington St. at Loyola Marymount",
     "team_name": "WSU",
     "game_key": "26FEB25WSULMU",
-    "espn_date": "20260226",
+    "espn_date": "20260225",
     "espn_team": "WSUST",
     "espn_opponent": "LMU",
     "model_p_win": 0.50

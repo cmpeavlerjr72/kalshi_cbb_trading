@@ -261,7 +261,9 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any],
         exposure = ExposureTracker(max_exposure_dollars=allocation)
 
         # Log directory
-        game_date = utc_now().strftime("%Y-%m-%d")
+        # Use Eastern time for date so evening games don't roll to next day
+        eastern_offset = dt.timezone(dt.timedelta(hours=-5))
+        game_date = dt.datetime.now(eastern_offset).strftime("%Y-%m-%d")
         log_dir = build_game_log_dir(label, game_date)
         log_dir.mkdir(parents=True, exist_ok=True)
 
