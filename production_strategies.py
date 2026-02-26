@@ -1360,6 +1360,7 @@ class RollingAverageStrategy(BaseStrategy):
         self._current_signal: Optional[str] = None  # "yes" | "no" | None
         self._last_acted_signal: Optional[str] = None
         self._pending_signal_change = False
+        self._last_strategy_type = params.get("strategy_type", "ema_tma")
 
     def _warmup_ticks(self) -> int:
         """Minimum ticks before signals are valid."""
@@ -1606,11 +1607,15 @@ class RollingAverageStrategy(BaseStrategy):
             self._fast_alpha = 2.0 / (fw + 1)
             self._slow_alpha = 2.0 / (sw + 1)
 
-        # If strategy_type changed, reset signal state
+        # If strategy_type actually changed, reset signal state
         if "strategy_type" in overrides:
-            self._current_signal = None
-            self._last_acted_signal = None
-            self._pending_signal_change = False
+            old_type = getattr(self, '_last_strategy_type', None)
+            new_type = overrides["strategy_type"]
+            if new_type != old_type:
+                self._current_signal = None
+                self._last_acted_signal = None
+                self._pending_signal_change = False
+                self._last_strategy_type = new_type
 
 
 # =============================================================================
