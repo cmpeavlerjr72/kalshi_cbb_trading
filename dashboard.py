@@ -2417,7 +2417,10 @@ function renderGames(data) {
     const bPosCount = (b.open_positions||[]).length;
     if (aPosCount > 0 && bPosCount === 0) return -1;
     if (aPosCount === 0 && bPosCount > 0) return 1;
-    return 0;
+    // Secondary sort: closest to signal (highest pct across tickers)
+    const aMaxPct = Math.max(0, ...(a.tickers||[]).map(t => t.mr_signal?.pct || 0));
+    const bMaxPct = Math.max(0, ...(b.tickers||[]).map(t => t.mr_signal?.pct || 0));
+    return bMaxPct - aMaxPct;
   });
 
   sortedGames.forEach(game => {
