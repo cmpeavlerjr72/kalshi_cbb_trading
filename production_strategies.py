@@ -11,6 +11,7 @@
 
 import os
 import sys
+import re
 import time
 import math
 import csv
@@ -2345,7 +2346,8 @@ class GameRunner:
 
         # Save summary JSON
         ts = utc_now().strftime("%Y%m%d_%H%M%S")
-        summary_path = f"logs/summary_{self.label}_{ts}.json"
+        safe_label = re.sub(r"[^A-Za-z0-9_\-]", "_", self.label)
+        summary_path = self.log_dir / f"summary_{safe_label}_{ts}.json"
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, default=str)
         print_status(f"[{self.label}] Summary: {summary_path}")
