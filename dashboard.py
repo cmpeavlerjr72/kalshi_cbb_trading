@@ -135,7 +135,7 @@ class R2Cache:
                     del self._store[k]
 
 
-_cache = R2Cache(ttl_secs=30, max_entries=300)
+_cache = R2Cache(ttl_secs=30, max_entries=200)
 
 
 # =============================================================================
@@ -1198,21 +1198,25 @@ def build_dashboard_data(date_str: str):
         except Exception:
             pass
 
+    # Only prefetch small files (trades, positions, events) — NOT snapshots.
+    # Snapshots grow large (10k+ rows) and caching them causes OOM on 512MB Render.
     prefetch_keys = []
+    SMALL_FILES = ("trades.csv", "positions.csv", "events.csv")
+    SMALL_TYPES = ("trades", "positions", "events")
     for game_info in games:
         for ticker_label in game_info["tickers"]:
             if ticker_label == "_flat" and "flat_files" in game_info:
                 ff = game_info["flat_files"]
-                for ftype in ("snapshots", "trades", "positions", "events"):
+                for ftype in SMALL_TYPES:
                     if ftype in ff:
                         prefetch_keys.append(ff[ftype])
             elif ticker_label == "_root" and "prefix_override" in game_info:
                 csv_prefix = game_info["prefix_override"]
-                for fname in ("snapshots.csv", "trades.csv", "positions.csv", "events.csv"):
+                for fname in SMALL_FILES:
                     prefetch_keys.append(f"{csv_prefix}/{fname}")
             else:
                 csv_prefix = f"{game_info['prefix']}/{ticker_label}"
-                for fname in ("snapshots.csv", "trades.csv", "positions.csv", "events.csv"):
+                for fname in SMALL_FILES:
                     prefetch_keys.append(f"{csv_prefix}/{fname}")
 
     # Filter out keys already in cache
@@ -1254,7 +1258,7 @@ def build_dashboard_data(date_str: str):
             if ticker_label == "_flat" and "flat_files" in game_info:
                 # Old flat format: individual R2 keys per file type
                 ff = game_info["flat_files"]
-                snapshots = fetch_csv_from_r2(ff["snapshots"]) if "snapshots" in ff else []
+                snapshots = fetch_csv_from_r2(ff["snapshots"], skip_cache=True) if "snapshots" in ff else []
                 trades = fetch_csv_from_r2(ff["trades"]) if "trades" in ff else []
                 positions = fetch_csv_from_r2(ff["positions"]) if "positions" in ff else []
                 events = fetch_csv_from_r2(ff["events"]) if "events" in ff else []
@@ -1262,7 +1266,7 @@ def build_dashboard_data(date_str: str):
             elif ticker_label == "_root" and "prefix_override" in game_info:
                 # Old nested format: CSVs directly in game folder
                 csv_prefix = game_info["prefix_override"]
-                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv")
+                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv", skip_cache=True)
                 trades = fetch_csv_from_r2(f"{csv_prefix}/trades.csv")
                 positions = fetch_csv_from_r2(f"{csv_prefix}/positions.csv")
                 events = fetch_csv_from_r2(f"{csv_prefix}/events.csv")
@@ -1270,7 +1274,7 @@ def build_dashboard_data(date_str: str):
             else:
                 # New format: ticker subfolder
                 csv_prefix = f"{game_info['prefix']}/{ticker_label}"
-                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv")
+                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv", skip_cache=True)
                 trades = fetch_csv_from_r2(f"{csv_prefix}/trades.csv")
                 positions = fetch_csv_from_r2(f"{csv_prefix}/positions.csv")
                 events = fetch_csv_from_r2(f"{csv_prefix}/events.csv")
