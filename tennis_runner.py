@@ -59,6 +59,10 @@ import re
 # CONFIGURATION
 # ============================================================================
 
+# Dynamic bankroll allocation: cap any single match to this fraction of total bankroll.
+# With 1-2 active matches each gets this fraction; with 3+ each gets bankroll/active_count.
+PER_MATCH_CAP_FRAC = float(os.getenv("MATCH_CAP_FRAC", "0.50"))
+
 TENNIS_SERIES = ["KXATPMATCH", "KXATPCHALLENGERMATCH", "KXWTAMATCH"]
 
 MATCHES_JSON_FILE = REPO_ROOT / "tennis_matches.json"
@@ -211,7 +215,9 @@ def find_ml_ticker_from_bundle(bundle: Dict[str, Any], player_code: str, match_k
 # ============================================================================
 
 def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any],
-              bundle: Optional[Dict[str, Any]] = None, uploader=None):
+              bundle: Optional[Dict[str, Any]] = None, uploader=None,
+              shared_exposure: Optional["ExposureTracker"] = None,
+              runners: Optional[Dict[str, "GameRunner"]] = None):
     label = match_config["label"]
     try:
         print_status(f"\n[{label}] Initializing...")
@@ -234,8 +240,8 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
 
         allocation = float(match_config["allocation"])
 
-        # Shared exposure tracker for this match
-        exposure = ExposureTracker(max_exposure_dollars=allocation)
+        # Use global shared exposure tracker if provided, else per-match fallback
+        exposure = shared_exposure if shared_exposure else ExposureTracker(max_exposure_dollars=allocation)
 
         # Log directory — derive series from ticker for correct subfolder
         match_date = utc_now().strftime("%Y-%m-%d")
@@ -305,6 +311,10 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
             base_strategy_overrides={"rolling_avg": TENNIS_RA_OVERRIDES},
         )
 
+        # Register runner for dynamic rebalancing
+        if runners is not None:
+            runners[label] = runner
+
         summary = runner.run()
         results[label] = summary
         print_status(f"[{label}] Complete")
@@ -314,6 +324,10 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
         import traceback
         traceback.print_exc()
         results[label] = {"error": str(e)}
+    finally:
+        # Unregister runner when match finishes
+        if runners is not None:
+            runners.pop(label, None)
 
 
 # ============================================================================
@@ -380,13 +394,33 @@ def load_matches_from_file() -> Optional[List[Dict[str, Any]]]:
 # MATCH WATCHER — hot-add new matches mid-session
 # ============================================================================
 
+def _rebalance_allocations(runners: Dict[str, "GameRunner"], bankroll: float):
+    """
+    Recompute per-match max_capital based on how many matches are currently active.
+    Each match gets min(bankroll / active_count, bankroll * PER_MATCH_CAP_FRAC).
+    """
+    active = {label: r for label, r in runners.items()}
+    n = len(active)
+    if n == 0:
+        return
+    new_alloc = min(bankroll / n, bankroll * PER_MATCH_CAP_FRAC)
+    for label, runner in active.items():
+        for strat in runner.strategies:
+            strat.update_max_capital(new_alloc)
+    print_status(f"[REBALANCE] {n} active matches → ${new_alloc:.2f}/match (bankroll=${bankroll:.2f}, cap={PER_MATCH_CAP_FRAC:.0%})")
+
+
 def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
                        results: Dict[str, Any], threads: List[threading.Thread],
                        private_key_path: str, bundle: Optional[Dict[str, Any]],
                        cloud_mode: bool, balance_per_match: float,
-                       stop_event: Optional[Any] = None, uploader=None):
+                       stop_event: Optional[Any] = None, uploader=None,
+                       shared_exposure: Optional["ExposureTracker"] = None,
+                       runners: Optional[Dict[str, "GameRunner"]] = None,
+                       bankroll: float = 0.0):
     """
     Periodically re-reads tennis_matches.json and launches threads for new matches.
+    Also rebalances capital allocations across active matches every cycle.
     Runs in main thread or as a daemon thread.
     """
     check_interval = 60  # seconds
@@ -396,6 +430,10 @@ def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
         time.sleep(check_interval)
 
         try:
+            # Rebalance allocations across active matches
+            if runners is not None and bankroll > 0:
+                _rebalance_allocations(runners, bankroll)
+
             new_matches = load_matches_from_file()
             if not new_matches:
                 continue
@@ -408,7 +446,10 @@ def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
 
                     # New match found — launch thread
                     running_keys.add(mk)
-                    m["allocation"] = float(m.get("allocation") or balance_per_match)
+                    # Compute allocation based on current active count + 1
+                    active_after = len(runners) + 1 if runners else 1
+                    new_alloc = min(bankroll / active_after, bankroll * PER_MATCH_CAP_FRAC) if bankroll > 0 else balance_per_match
+                    m["allocation"] = float(m.get("allocation") or new_alloc)
 
                     try:
                         match_pk = _load_private_key(private_key_path)
@@ -418,13 +459,18 @@ def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
 
                     t = threading.Thread(
                         target=run_match,
-                        args=(m, match_pk, results, bundle, uploader),
+                        args=(m, match_pk, results, bundle, uploader,
+                              shared_exposure, runners),
                         name=m.get("label", mk),
                         daemon=False,
                     )
                     t.start()
                     threads.append(t)
                     print_status(f"[WATCHER] Hot-added: {m.get('label', mk)} (alloc=${m['allocation']:.2f})")
+
+                    # Rebalance existing matches to account for the new one
+                    if runners is not None and bankroll > 0:
+                        _rebalance_allocations(runners, bankroll)
 
         except Exception as e:
             print_status(f"[WATCHER] Error: {e}")
@@ -535,14 +581,17 @@ def main() -> int:
     try:
         resp = _get(private_key, "/trade-api/v2/portfolio/balance")
         balance_cents = int(resp.get("balance", 0))
-        balance = balance_cents / 100.0
-        print_status(f"Balance: ${balance:.2f}")
+        bankroll = balance_cents / 100.0
+        print_status(f"Balance: ${bankroll:.2f}")
 
-        per_match_allocation = balance / max(1, len(matches))
+        # Global shared exposure tracker — prevents total portfolio overspend
+        global_exposure = ExposureTracker(max_exposure_dollars=bankroll)
+
+        per_match_allocation = min(bankroll / max(1, len(matches)), bankroll * PER_MATCH_CAP_FRAC)
         for m in matches:
             m["allocation"] = float(m.get("allocation") or per_match_allocation)
 
-        print_status(f"Default per-match allocation: ${per_match_allocation:.2f}")
+        print_status(f"Default per-match allocation: ${per_match_allocation:.2f} (cap={PER_MATCH_CAP_FRAC:.0%})")
     except Exception as e:
         print_status(f"Balance check failed: {e}")
         return 1
@@ -592,6 +641,7 @@ def main() -> int:
     # --- Launch match threads ---
     results: Dict[str, Any] = {}
     threads: List[threading.Thread] = []
+    runners: Dict[str, GameRunner] = {}  # shared dict for rebalancing (label -> GameRunner)
 
     key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip()
 
@@ -606,7 +656,8 @@ def main() -> int:
         match_pk = _load_private_key(key_path)
         t = threading.Thread(
             target=run_match,
-            args=(match, match_pk, results, bundle, uploader),
+            args=(match, match_pk, results, bundle, uploader,
+                  global_exposure, runners),
             name=match["label"],
             daemon=False,
         )
@@ -618,12 +669,13 @@ def main() -> int:
     watcher_thread = threading.Thread(
         target=match_watcher_loop,
         args=(running_keys, running_keys_lock, results, threads,
-              key_path, bundle, cloud_mode, per_match_allocation, stop, uploader),
+              key_path, bundle, cloud_mode, per_match_allocation, stop, uploader,
+              global_exposure, runners, bankroll),
         name="match_watcher",
         daemon=True,
     )
     watcher_thread.start()
-    print_status("[WATCHER] Match watcher started (checks every 60s for new matches)")
+    print_status("[WATCHER] Match watcher started (checks every 60s for new matches + rebalance)")
 
     # --- Wait for threads ---
     if cloud_mode and stop:

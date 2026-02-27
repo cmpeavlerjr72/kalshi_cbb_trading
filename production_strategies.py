@@ -45,6 +45,7 @@ from combo_vnext import (
     MIN_LIQUIDITY_CONTRACTS,
 )
 from fetch_kalshi_ledger import fetch_positions
+from fill_verifier import FillVerifier
 
 # =============================================================================
 # FEE CALCULATIONS (P5)
@@ -303,6 +304,10 @@ class BaseStrategy(ABC):
 
         return True, "ok"
 
+    def update_max_capital(self, amount: float):
+        """Dynamically adjust max_capital (used by bankroll rebalancer)."""
+        self.max_capital = amount
+
     def update_params(self, overrides: dict):
         """Hot-reload: merge new param values and rebuild dependent state."""
         self.params.update(overrides)
@@ -425,8 +430,13 @@ class BaseStrategy(ABC):
         self.positions.remove(position)
 
         # Free capital — matches the price we paid on entry
-        self.capital_used -= position.entry_price * position.qty / 100
+        cost = position.entry_price * position.qty / 100
+        self.capital_used -= cost
         self.capital_used = max(0, self.capital_used)
+
+        # Release from shared exposure tracker
+        if hasattr(self, 'exposure_tracker') and self.exposure_tracker:
+            self.exposure_tracker.release(cost)
 
         # P1: Record stop-out for cooldown
         if exit_type == "stop":
@@ -1792,6 +1802,9 @@ class GameRunner:
         self._init_logs()
         self.snapshots = 0
 
+        # Fill verification
+        self.verifier = FillVerifier(private_key, log_dir, ticker)
+
         # Live config reload
         self._config_path = Path("strategy_config.json")
         self._last_config_mtime = 0.0
@@ -1947,11 +1960,13 @@ class GameRunner:
                 print_status(f"[{self.label}][{strategy.name}] FILLED [{mode}] {filled}x @ {actual:.1f}c (fee={fee:.1f}c)")
                 strategy.on_entry_result(True, context)
                 self._log_trade(strategy.name, f"entry_fill_{mode}", side, price, actual, filled, fee, reason, order_id)
+                self.verifier.register_order(order_id, side, f"entry_fill_{mode}", filled, actual, fee, strategy.name)
                 return pos
             else:
                 print_status(f"[{self.label}][{strategy.name}] NO FILL [{mode}]")
                 strategy.on_entry_result(False, context)
                 self._log_trade(strategy.name, f"entry_nofill_{mode}", side, price, 0, 0, 0, reason, order_id)
+                self.verifier.register_order(order_id, side, f"entry_nofill_{mode}", 0, 0, 0, strategy.name)
                 return None
 
         except Exception as e:
@@ -2055,6 +2070,7 @@ class GameRunner:
                     else:
                         print_status(f"[{self.label}][{strategy.name}] EXIT NO FILL [taker fallback]")
                         self._log_event(strategy.name, "exit_nofill", f"{position.side}@{taker_price}c")
+                        self.verifier.register_order(order_id, position.side, "exit_nofill_taker_fallback", 0, 0, 0, strategy.name)
                         return None
 
             else:
@@ -2067,6 +2083,7 @@ class GameRunner:
                 else:
                     print_status(f"[{self.label}][{strategy.name}] EXIT NO FILL")
                     self._log_event(strategy.name, "exit_nofill", f"{position.side}@{price}c")
+                    self.verifier.register_order(order_id, position.side, "exit_nofill_taker", 0, 0, 0, strategy.name)
                     return None
 
             closed = strategy.record_exit(position, exit_type, actual_exit, lock_price)
@@ -2080,6 +2097,7 @@ class GameRunner:
             print_status(f"[{self.label}][{strategy.name}] CLOSED [{mode}]: net={closed.net_pnl:.1f}c")
             self._log_trade(strategy.name, f"exit_{exit_type}_{mode}", position.side, price,
                            actual_exit, position.qty, fee, reason, order_id)
+            self.verifier.register_order(order_id, position.side, f"exit_{exit_type}_{mode}", position.qty, actual_exit, fee, strategy.name)
             self._log_position(closed)
             return closed
 
@@ -2333,6 +2351,13 @@ class GameRunner:
 
             time.sleep(POLL_INTERVAL_SECS)
 
+            # Fill verification tick (~every 30s, managed internally)
+            newly_verified = self.verifier.tick()
+            for v in newly_verified:
+                if v.get("status") in ("mismatch", "missing"):
+                    self._log_event("verify", f"fill_{v['status']}",
+                                   f"order_id={v['order_id']} {v.get('mismatch_details', '')}")
+
         # --- Final summary ---
         print_status(f"[{self.label}] === SUMMARY ===")
         result = {"strategies": {}}
@@ -2357,8 +2382,21 @@ class GameRunner:
             json.dump(result, f, indent=2, default=str)
         print_status(f"[{self.label}] Summary: {summary_path}")
 
-        # Verify fills against Kalshi
-        self._verify_fills()
+        # Verify fills against Kalshi (real-time verifier flush)
+        verify_summary = self.verifier.flush()
+        mismatches = self.verifier.get_mismatches()
+        if mismatches:
+            for m in mismatches:
+                print_status(
+                    f"\033[1;31m[{self.label}] FILL {m['status'].upper()}: "
+                    f"order_id={m['order_id']} {m.get('mismatch_details', '')}\033[0m"
+                )
+        print_status(
+            f"[{self.label}] Fill verification: "
+            f"{verify_summary.get('confirmed', 0)}/{verify_summary.get('total', 0)} confirmed, "
+            f"{verify_summary.get('mismatch', 0)} mismatches, "
+            f"{verify_summary.get('missing', 0)} missing"
+        )
 
         return result
 
