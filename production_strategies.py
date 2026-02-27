@@ -41,6 +41,7 @@ from combo_vnext import (
     has_fill_liquidity_for_implied_buy,
     cancel_order,
     fetch_fills_for_order,
+    fetch_market,
     SERIES_TICKER,
     MIN_LIQUIDITY_CONTRACTS,
 )
@@ -2147,6 +2148,87 @@ class GameRunner:
                     self._log_event(strategy.name, "settlement_warning",
                                    f"{pos.side}@{pos.entry_price:.0f}c mid={mid:.0f}c")
 
+    def _settle_open_positions(self):
+        """After market close, poll Kalshi for settlement result and close out open positions."""
+        open_count = sum(len(s.positions) for s in self.strategies)
+        if open_count == 0:
+            return
+
+        print_status(f"[{self.label}] {open_count} open position(s) — waiting for settlement...")
+        self._log_event("system", "settlement_wait", f"{open_count} open positions")
+
+        # Poll for market result (Kalshi settles within a few minutes of close)
+        result_side = None
+        for attempt in range(20):  # up to ~5 minutes
+            time.sleep(15)
+            try:
+                mkt = fetch_market(self.private_key, self.ticker)
+                status = mkt.get("status", "")
+                mkt_result = mkt.get("result", "")
+                if status == "settled" or mkt_result in ("yes", "no"):
+                    result_side = mkt_result  # "yes" or "no"
+                    print_status(f"[{self.label}] Market settled: {result_side.upper()} (attempt {attempt+1})")
+                    self._log_event("system", "settlement_result", result_side)
+                    break
+                if status == "finalized" and mkt_result:
+                    result_side = mkt_result
+                    print_status(f"[{self.label}] Market finalized: {result_side.upper()} (attempt {attempt+1})")
+                    self._log_event("system", "settlement_result", result_side)
+                    break
+            except Exception as e:
+                print_status(f"[{self.label}] Settlement poll error: {e}")
+
+        if not result_side:
+            print_status(f"[{self.label}] Settlement not available after polling — positions remain open in logs")
+            self._log_event("system", "settlement_timeout", f"{open_count} positions unsettled")
+            return
+
+        # Close out each open position at settlement price
+        for strategy in self.strategies:
+            for pos in list(strategy.positions):
+                won = (pos.side == result_side)
+                settlement_price = 100.0 if won else 0.0
+                # No fee on settlement — Kalshi auto-settles
+                gross_pnl = (settlement_price - pos.entry_price) * pos.qty
+                net_pnl = gross_pnl - pos.entry_fee  # no exit fee
+
+                now = utc_now()
+                hold_secs = int((now - pos.entry_time).total_seconds())
+
+                closed = ClosedPosition(
+                    id=pos.id,
+                    strategy=strategy.name,
+                    side=pos.side,
+                    entry_price=pos.entry_price,
+                    exit_price=settlement_price,
+                    qty=pos.qty,
+                    entry_time=pos.entry_time.isoformat() if hasattr(pos.entry_time, 'isoformat') else str(pos.entry_time),
+                    exit_time=now.isoformat(),
+                    exit_type="settlement",
+                    entry_fee=pos.entry_fee,
+                    exit_fee=0.0,
+                    gross_pnl=gross_pnl,
+                    net_pnl=net_pnl,
+                    hold_secs=hold_secs,
+                )
+                strategy.closed.append(closed)
+                strategy.positions.remove(pos)
+
+                outcome = "WIN" if won else "LOSS"
+                print_status(
+                    f"[{self.label}][{strategy.name}] SETTLED [{outcome}]: "
+                    f"{pos.side.upper()} @{pos.entry_price:.0f}c → {settlement_price:.0f}c, "
+                    f"net={net_pnl:.1f}c ({pos.qty} contracts)"
+                )
+
+                # Log trade and position records
+                self._log_trade(
+                    strategy.name, "exit_settlement", pos.side,
+                    settlement_price, settlement_price, pos.qty, 0.0,
+                    f"market settled {result_side}", "",
+                )
+                self._log_position(closed)
+
     def _calc_unrealized_pnl(self, prices: Dict[str, Any]) -> float:
         """
         Mark-to-market UNREALIZED net PnL (in cents), using best bids as exit.
@@ -2357,6 +2439,9 @@ class GameRunner:
                 if v.get("status") in ("mismatch", "missing"):
                     self._log_event("verify", f"fill_{v['status']}",
                                    f"order_id={v['order_id']} {v.get('mismatch_details', '')}")
+
+        # --- Settlement: close out positions held to market close ---
+        self._settle_open_positions()
 
         # --- Final summary ---
         print_status(f"[{self.label}] === SUMMARY ===")

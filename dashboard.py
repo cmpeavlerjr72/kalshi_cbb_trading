@@ -954,6 +954,18 @@ def compute_open_positions(trades):
     return open_pos
 
 
+def _infer_settlement_from_snapshots(snapshots):
+    """Walk snapshots backwards to find the last live mid, then infer winner.
+    Returns "yes" or "no", or None if we can't determine."""
+    for snap in reversed(snapshots):
+        mid = safe_float(snap.get("mid"))
+        if mid > 0:
+            # Markets converge toward 0 or 100 near close.
+            # A final mid > 50 means YES won, < 50 means NO won.
+            return "yes" if mid > 50 else "no"
+    return None
+
+
 def mark_to_market(open_positions, latest_snapshot):
     """Value open positions at latest bid minus estimated exit fee."""
     if not latest_snapshot:
@@ -1316,6 +1328,43 @@ def build_dashboard_data(date_str: str):
             for p in open_pos:
                 p["raw_ticker"] = p.get("ticker", "")
                 p["ticker"] = ticker_label
+
+            # Infer settlement for positions in closed markets.
+            # If market is dead (no bid/ask) and positions are still "open",
+            # the market settled and we can determine the result from the last
+            # snapshot where prices were still live.
+            _snap_mid = safe_float(latest_snap.get("mid")) if latest_snap else 0
+            _snap_yes_bid = safe_float(latest_snap.get("yes_bid")) if latest_snap else 0
+            market_is_dead = (_snap_mid == 0 and _snap_yes_bid == 0)
+            if market_is_dead and open_pos:
+                # Find the last snapshot with a real mid to infer who won
+                inferred_result = _infer_settlement_from_snapshots(snapshots)
+                if inferred_result:
+                    settled_pnl = 0.0
+                    for p in open_pos:
+                        won = (p["side"] == inferred_result)
+                        settle_px = 100.0 if won else 0.0
+                        gross = (settle_px - p["entry_price"]) * p["qty"]
+                        net = gross - p.get("fee", 0)
+                        settled_pnl += net
+                        # Add as a synthetic closed position record
+                        positions.append({
+                            "position_id": f"settle_{p.get('order_id', 'x')}",
+                            "strategy": p.get("strategy", ""),
+                            "side": p["side"],
+                            "entry_price": p["entry_price"],
+                            "entry_time": p.get("entry_time", ""),
+                            "entry_fee": p.get("fee", 0),
+                            "exit_price": settle_px,
+                            "exit_time": latest_snap.get("timestamp", "") if latest_snap else "",
+                            "exit_type": "settlement",
+                            "exit_fee": 0,
+                            "gross_pnl": gross,
+                            "net_pnl": net,
+                            "hold_secs": 0,
+                        })
+                    open_pos = []  # all settled now
+
             open_pos = mark_to_market(open_pos, latest_snap)
 
             # Enrich open positions with fill verification data
