@@ -863,6 +863,25 @@ def fetch_csv_from_r2(key: str, skip_cache: bool = False):
         return []
 
 
+def fetch_json_from_r2(key: str):
+    """Fetch a JSON file from R2, return parsed dict. Uses 15s cache."""
+    cached = _cache.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        s3 = get_s3_client()
+        resp = s3.get_object(Bucket=R2_BUCKET, Key=key)
+        body = resp["Body"].read().decode("utf-8")
+        data = json.loads(body)
+        _cache.put(key, data)
+        return data
+    except Exception as e:
+        if "NoSuchKey" in str(e) or "404" in str(e):
+            return {}
+        return {}
+
+
 # =============================================================================
 # FEE CALC (mirrors production_strategies.py:49)
 # =============================================================================
@@ -912,6 +931,7 @@ def compute_open_positions(trades):
                 "entry_time": t.get("timestamp", ""),
                 "reason": t.get("reason", ""),
                 "fee": safe_float(t.get("fee_cents")),
+                "order_id": t.get("order_id", ""),
             })
         elif action.startswith("exit_") and action != "exit_error":
             exit_qty = safe_int(t.get("qty"))
@@ -1208,6 +1228,7 @@ def build_dashboard_data(date_str: str):
                 trades = fetch_csv_from_r2(ff["trades"]) if "trades" in ff else []
                 positions = fetch_csv_from_r2(ff["positions"]) if "positions" in ff else []
                 events = fetch_csv_from_r2(ff["events"]) if "events" in ff else []
+                verified_fills = {}
             elif ticker_label == "_root" and "prefix_override" in game_info:
                 # Old nested format: CSVs directly in game folder
                 csv_prefix = game_info["prefix_override"]
@@ -1215,6 +1236,7 @@ def build_dashboard_data(date_str: str):
                 trades = fetch_csv_from_r2(f"{csv_prefix}/trades.csv")
                 positions = fetch_csv_from_r2(f"{csv_prefix}/positions.csv")
                 events = fetch_csv_from_r2(f"{csv_prefix}/events.csv")
+                verified_fills = fetch_json_from_r2(f"{csv_prefix}/verified_fills.json")
             else:
                 # New format: ticker subfolder
                 csv_prefix = f"{game_info['prefix']}/{ticker_label}"
@@ -1222,6 +1244,7 @@ def build_dashboard_data(date_str: str):
                 trades = fetch_csv_from_r2(f"{csv_prefix}/trades.csv")
                 positions = fetch_csv_from_r2(f"{csv_prefix}/positions.csv")
                 events = fetch_csv_from_r2(f"{csv_prefix}/events.csv")
+                verified_fills = fetch_json_from_r2(f"{csv_prefix}/verified_fills.json")
 
             # For old formats, derive a display label from the ticker column in CSV
             if ticker_label in ("_root", "_flat") and snapshots:
@@ -1253,6 +1276,29 @@ def build_dashboard_data(date_str: str):
                 p["raw_ticker"] = p.get("ticker", "")
                 p["ticker"] = ticker_label
             open_pos = mark_to_market(open_pos, latest_snap)
+
+            # Enrich open positions with fill verification data
+            vf_orders = {}
+            if verified_fills and verified_fills.get("orders"):
+                for vo in verified_fills["orders"]:
+                    oid = vo.get("order_id")
+                    if oid:
+                        vf_orders[oid] = vo
+            for p in open_pos:
+                oid = p.get("order_id", "")
+                if oid and oid in vf_orders:
+                    vo = vf_orders[oid]
+                    p["verified"] = vo.get("status") == "confirmed"
+                    p["verify_status"] = vo.get("status", "")
+                    p["verify_warning"] = vo.get("mismatch_details") or ""
+                    if vo.get("kalshi_vwap") is not None:
+                        p["kalshi_price"] = vo["kalshi_vwap"]
+                    if vo.get("kalshi_fee") is not None:
+                        p["kalshi_fee"] = vo["kalshi_fee"]
+                else:
+                    p["verified"] = None  # no data yet
+                    p["verify_status"] = ""
+                    p["verify_warning"] = ""
 
             # Closed position stats
             closed_stats = aggregate_closed_positions(positions)
@@ -1290,6 +1336,9 @@ def build_dashboard_data(date_str: str):
             # Release snapshot data — it's the largest object per ticker
             del snapshots
 
+            # Fill verification summary for this ticker
+            vf_summary = verified_fills.get("summary", {}) if verified_fills else {}
+
             ticker_data = {
                 "label": ticker_label,
                 "type": ticker_type(ticker_label),
@@ -1307,6 +1356,7 @@ def build_dashboard_data(date_str: str):
                 "markers": trade_markers,
                 "mr_signal": mr_signal,
                 "orders": order_activity,
+                "fill_verification": vf_summary,
             }
             game_data["tickers"].append(ticker_data)
 
@@ -1440,6 +1490,29 @@ def build_dashboard_data(date_str: str):
                     })
         except Exception as e:
             print(f"[dashboard] Reconciliation error: {e}")
+
+    # --- Fill verification aggregation across all games ---
+    fill_verify_totals = {"confirmed": 0, "mismatch": 0, "missing": 0, "pending": 0, "partial": 0, "total": 0}
+    fill_verify_warnings = []
+    for game_data in result["games"]:
+        for t in game_data.get("tickers", []):
+            fv = t.get("fill_verification", {})
+            for k in ("confirmed", "mismatch", "missing", "pending", "partial", "total"):
+                fill_verify_totals[k] += fv.get(k, 0)
+        for pos in game_data.get("open_positions", []):
+            if pos.get("verify_status") in ("mismatch", "missing"):
+                fill_verify_warnings.append({
+                    "ticker": pos.get("ticker", ""),
+                    "side": pos.get("side", ""),
+                    "order_id": pos.get("order_id", ""),
+                    "status": pos.get("verify_status", ""),
+                    "warning": pos.get("verify_warning", ""),
+                    "bot_price": pos.get("entry_price", 0),
+                    "kalshi_price": pos.get("kalshi_price"),
+                })
+    result["fill_verification"] = fill_verify_totals
+    result["fill_verify_warnings"] = fill_verify_warnings
+    result["has_fill_mismatch"] = len(fill_verify_warnings) > 0
 
     return result
 
@@ -1698,6 +1771,17 @@ svg text { font-family:inherit; }
 .recon-banner .ok { color:var(--green); }
 .recon-ok-banner { background:#1a3a1a; border:1px solid var(--green); border-radius:6px; padding:6px 14px; margin-bottom:10px; display:none; font-size:12px; color:var(--green); }
 .recon-ok-banner.visible { display:block; }
+.fill-banner { background:#3a1a1a; border:2px solid var(--red); border-radius:6px; padding:10px 14px; margin-bottom:10px; display:none; }
+.fill-banner.visible { display:block; }
+.fill-banner h3 { color:var(--red); margin-bottom:6px; font-size:14px; }
+.fill-banner table { width:100%; border-collapse:collapse; font-size:12px; }
+.fill-banner th { text-align:left; color:var(--text2); padding:3px 8px; border-bottom:1px solid var(--border); }
+.fill-banner td { padding:3px 8px; border-bottom:1px solid var(--bg3); }
+.fill-banner .mismatch { color:var(--red); font-weight:bold; }
+.fill-banner .missing { color:var(--orange); font-weight:bold; }
+.verify-ok { color:var(--green); font-weight:bold; font-size:11px; }
+.verify-warn { color:var(--red); font-weight:bold; font-size:11px; }
+.verify-pending { color:var(--text2); font-size:11px; }
 </style>
 </head>
 <body>
@@ -1720,6 +1804,7 @@ svg text { font-family:inherit; }
   <div class="stat-card"><div class="label">Capital Risked</div><div class="value neutral" id="capitalRisked">--</div></div>
   <div class="stat-card"><div class="label">Open Positions</div><div class="value neutral" id="openCount">--</div></div>
   <div class="stat-card"><div class="label">Win Rate</div><div class="value neutral" id="winRate">--</div></div>
+  <div class="stat-card"><div class="label">Fill Verification</div><div class="value neutral" id="fillVerify">--</div></div>
 </div>
 
 <div class="portfolio" id="mlVsSpread" style="grid-template-columns:repeat(4,1fr);">
@@ -1756,6 +1841,13 @@ svg text { font-family:inherit; }
   <table>
     <thead><tr><th>Ticker</th><th>Side</th><th>Bot Qty</th><th>Kalshi Qty</th><th>Status</th></tr></thead>
     <tbody id="reconBody"></tbody>
+  </table>
+</div>
+<div class="fill-banner" id="fillBanner">
+  <h3>FILL VERIFICATION WARNING</h3>
+  <table>
+    <thead><tr><th>Ticker</th><th>Side</th><th>Order ID</th><th>Bot Price</th><th>Kalshi Price</th><th>Status</th><th>Detail</th></tr></thead>
+    <tbody id="fillBody"></tbody>
   </table>
 </div>
 
@@ -2208,6 +2300,50 @@ function renderPortfolio(p) {
   wr.textContent = total > 0 ? (p.win_rate*100).toFixed(0)+'% ('+p.wins+'W-'+p.losses+'L)' : '--';
 }
 
+function renderFillVerification(data) {
+  // Stat card
+  const fv = data.fill_verification || {};
+  const el = document.getElementById('fillVerify');
+  if (fv.total > 0) {
+    const ok = fv.confirmed || 0;
+    const warn = (fv.mismatch || 0) + (fv.missing || 0);
+    const pend = (fv.pending || 0) + (fv.partial || 0);
+    if (warn > 0) {
+      el.textContent = ok + '/' + fv.total + ' OK, ' + warn + ' WARN';
+      el.className = 'value negative';
+    } else if (pend > 0) {
+      el.textContent = ok + '/' + fv.total + ' OK, ' + pend + ' pending';
+      el.className = 'value neutral';
+    } else {
+      el.textContent = ok + '/' + fv.total + ' OK';
+      el.className = 'value positive';
+    }
+  } else {
+    el.textContent = '--';
+    el.className = 'value neutral';
+  }
+
+  // Fill warnings banner
+  const banner = document.getElementById('fillBanner');
+  const body = document.getElementById('fillBody');
+  const warnings = data.fill_verify_warnings || [];
+  if (warnings.length > 0) {
+    body.innerHTML = '';
+    warnings.forEach(w => {
+      const cls = w.status === 'mismatch' ? 'mismatch' : 'missing';
+      body.innerHTML += '<tr><td>' + w.ticker + '</td><td>' + (w.side||'').toUpperCase() +
+        '</td><td style="font-family:monospace;font-size:10px;">' + (w.order_id||'').slice(0,12) + '...' +
+        '</td><td>' + (w.bot_price!=null ? w.bot_price.toFixed(1)+'c' : '--') +
+        '</td><td>' + (w.kalshi_price!=null ? w.kalshi_price.toFixed(1)+'c' : '--') +
+        '</td><td class="' + cls + '">' + w.status.toUpperCase() +
+        '</td><td>' + (w.warning||'') + '</td></tr>';
+    });
+    banner.className = 'fill-banner visible';
+  } else {
+    banner.className = 'fill-banner';
+  }
+}
+
 function renderMlVsSpread(mvs) {
   if (!mvs) return;
   const mt = document.getElementById('mlTotal');
@@ -2424,15 +2560,11 @@ function renderGames(data) {
   });
 
   sortedGames.forEach(game => {
-    // Skip inactive games: market settled/empty, no open positions, no capital risked
+    // Skip inactive games: all tickers show "--" for mid (no orderbook data)
     if (hideInactive) {
-      const hasActiveMarket = (game.tickers||[]).some(t => {
-        const mid = t.mid || 0;
-        return mid > 3 && mid < 97;  // not settled near 0 or 100
-      });
+      const hasMid = (game.tickers||[]).some(t => t.mid && t.mid > 0);
       const hasPositions = (game.open_positions||[]).length > 0;
-      const hasRisked = (game.tickers||[]).some(t => (t.capital_risked||0) > 0);
-      if (!hasActiveMarket && !hasPositions && !hasRisked) return;
+      if (!hasMid && !hasPositions) return;
     }
 
     const gameKey = game.game;
@@ -2540,9 +2672,12 @@ function renderGames(data) {
     // Open positions
     if (game.open_positions && game.open_positions.length > 0) {
       html += '<h3>Open Positions</h3>';
-      html += '<table><tr><th>Strategy</th><th>Ticker</th><th>Side</th><th>Entry</th><th>Qty</th><th>Mark</th><th>Age</th><th>Unrealized</th></tr>';
+      html += '<table><tr><th>Strategy</th><th>Ticker</th><th>Side</th><th>Entry</th><th>Qty</th><th>Mark</th><th>Age</th><th>Unrealized</th><th>Verified</th></tr>';
       game.open_positions.forEach(p => {
         const sideTag = p.side==='yes'?'tag-yes':'tag-no';
+        let verifyBadge = '<span class="verify-pending">--</span>';
+        if (p.verified === true) verifyBadge = '<span class="verify-ok">OK</span>';
+        else if (p.verified === false) verifyBadge = '<span class="verify-warn" title="'+(p.verify_warning||'')+'">WARN</span>';
         html += '<tr>';
         html += '<td>'+p.strategy+'</td>';
         html += '<td>'+p.ticker+'</td>';
@@ -2552,6 +2687,7 @@ function renderGames(data) {
         html += '<td>'+(p.mark_price?p.mark_price.toFixed(1)+'c':'--')+'</td>';
         html += '<td>'+fmtAge(p.age_secs)+'</td>';
         html += '<td class="'+pnlClass(p.unrealized_pnl)+'">'+fmtCents(p.unrealized_pnl)+'</td>';
+        html += '<td>'+verifyBadge+'</td>';
         html += '</tr>';
       });
       html += '</table>';
@@ -2669,6 +2805,7 @@ async function fetchData() {
     renderCharts(data);
     renderGames(data);
     renderReconciliation(data);
+    renderFillVerification(data);
 
     // Hide ML vs Spread row when no CBB games visible
     const hasCbb = (data.games||[]).some(g => (g.sport||'cbb') === 'cbb');
