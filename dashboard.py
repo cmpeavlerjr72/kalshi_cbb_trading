@@ -968,11 +968,11 @@ def _trim_prematch(snapshots, buffer=50):
             break
     if initial_mid is None:
         return snapshots
-    # Find first index where mid deviates by >= 1c from initial
+    # Find first index where mid deviates by >= 3c from initial
     first_move = None
     for i, s in enumerate(snapshots):
         m = safe_float(s.get("mid"))
-        if m > 0 and abs(m - initial_mid) >= 1.0:
+        if m > 0 and abs(m - initial_mid) >= 3.0:
             first_move = i
             break
     if first_move is None:
