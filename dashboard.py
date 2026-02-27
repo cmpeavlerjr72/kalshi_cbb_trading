@@ -16,6 +16,7 @@ import gzip
 import json
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
@@ -134,7 +135,7 @@ class R2Cache:
                     del self._store[k]
 
 
-_cache = R2Cache(ttl_secs=15, max_entries=100)
+_cache = R2Cache(ttl_secs=30, max_entries=300)
 
 
 # =============================================================================
@@ -1190,6 +1191,36 @@ def build_dashboard_data(date_str: str):
         "fetch_time": datetime.now(timezone.utc).isoformat(),
     }
 
+    # Prefetch all CSVs in parallel to warm the cache
+    def _prefetch_csv(key):
+        try:
+            fetch_csv_from_r2(key)
+        except Exception:
+            pass
+
+    prefetch_keys = []
+    for game_info in games:
+        for ticker_label in game_info["tickers"]:
+            if ticker_label == "_flat" and "flat_files" in game_info:
+                ff = game_info["flat_files"]
+                for ftype in ("snapshots", "trades", "positions", "events"):
+                    if ftype in ff:
+                        prefetch_keys.append(ff[ftype])
+            elif ticker_label == "_root" and "prefix_override" in game_info:
+                csv_prefix = game_info["prefix_override"]
+                for fname in ("snapshots.csv", "trades.csv", "positions.csv", "events.csv"):
+                    prefetch_keys.append(f"{csv_prefix}/{fname}")
+            else:
+                csv_prefix = f"{game_info['prefix']}/{ticker_label}"
+                for fname in ("snapshots.csv", "trades.csv", "positions.csv", "events.csv"):
+                    prefetch_keys.append(f"{csv_prefix}/{fname}")
+
+    # Filter out keys already in cache
+    keys_to_fetch = [k for k in prefetch_keys if _cache.get(k) is None]
+    if keys_to_fetch:
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            pool.map(_prefetch_csv, keys_to_fetch)
+
     for game_info in games:
         game_key = game_info["game"]
         game_sport = game_info.get("sport", "cbb")
@@ -1220,11 +1251,10 @@ def build_dashboard_data(date_str: str):
 
         for ticker_label in game_info["tickers"]:
             # Determine how to fetch CSVs based on format
-            # Snapshots skip cache — they're large and change every cycle
             if ticker_label == "_flat" and "flat_files" in game_info:
                 # Old flat format: individual R2 keys per file type
                 ff = game_info["flat_files"]
-                snapshots = fetch_csv_from_r2(ff["snapshots"], skip_cache=True) if "snapshots" in ff else []
+                snapshots = fetch_csv_from_r2(ff["snapshots"]) if "snapshots" in ff else []
                 trades = fetch_csv_from_r2(ff["trades"]) if "trades" in ff else []
                 positions = fetch_csv_from_r2(ff["positions"]) if "positions" in ff else []
                 events = fetch_csv_from_r2(ff["events"]) if "events" in ff else []
@@ -1232,7 +1262,7 @@ def build_dashboard_data(date_str: str):
             elif ticker_label == "_root" and "prefix_override" in game_info:
                 # Old nested format: CSVs directly in game folder
                 csv_prefix = game_info["prefix_override"]
-                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv", skip_cache=True)
+                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv")
                 trades = fetch_csv_from_r2(f"{csv_prefix}/trades.csv")
                 positions = fetch_csv_from_r2(f"{csv_prefix}/positions.csv")
                 events = fetch_csv_from_r2(f"{csv_prefix}/events.csv")
@@ -1240,7 +1270,7 @@ def build_dashboard_data(date_str: str):
             else:
                 # New format: ticker subfolder
                 csv_prefix = f"{game_info['prefix']}/{ticker_label}"
-                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv", skip_cache=True)
+                snapshots = fetch_csv_from_r2(f"{csv_prefix}/snapshots.csv")
                 trades = fetch_csv_from_r2(f"{csv_prefix}/trades.csv")
                 positions = fetch_csv_from_r2(f"{csv_prefix}/positions.csv")
                 events = fetch_csv_from_r2(f"{csv_prefix}/events.csv")
@@ -1256,6 +1286,13 @@ def build_dashboard_data(date_str: str):
                 if not trades and not positions and not events:
                     continue
                 ticker_label = game_info["game"]
+
+            # Downsample large snapshot arrays — keep every Nth row + always keep last
+            # Charts/signals work fine with 500-1000 points; no need for 10k+ rows
+            MAX_SNAP_ROWS = 1000
+            if len(snapshots) > MAX_SNAP_ROWS:
+                step = len(snapshots) // MAX_SNAP_ROWS
+                snapshots = snapshots[::step] + [snapshots[-1]]
 
             # Latest snapshot for this ticker
             latest_snap = snapshots[-1] if snapshots else {}
