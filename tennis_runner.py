@@ -423,20 +423,45 @@ def load_matches_from_file() -> Optional[List[Dict[str, Any]]]:
 # MATCH WATCHER — hot-add new matches mid-session
 # ============================================================================
 
+MIN_VOL_FOR_ACTIVE = 0.5  # min std of recent mids to count as "in play"
+
+
 def _rebalance_allocations(runners: Dict[str, "GameRunner"], bankroll: float):
     """
-    Recompute per-match max_capital based on how many matches are currently active.
-    Each match gets min(bankroll / active_count, bankroll * PER_MATCH_CAP_FRAC).
+    Recompute per-match max_capital based on how many matches are currently IN PLAY.
+    A match is "in play" if its market has real price movement (volatility > threshold).
+    Pre-match markets with flat prices get $0 allocation until they start moving.
     """
-    active = {label: r for label, r in runners.items()}
-    n = len(active)
+    in_play = {}
+    dormant = {}
+    for label, r in runners.items():
+        vol = r.quality.recent_volatility() if hasattr(r, 'quality') else 0.0
+        if vol >= MIN_VOL_FOR_ACTIVE:
+            in_play[label] = r
+        else:
+            dormant[label] = r
+
+    n = len(in_play)
     if n == 0:
+        # Nothing in play yet — give everyone a small baseline so they can
+        # enter if a match suddenly starts
+        baseline = min(bankroll / max(1, len(runners)), bankroll * PER_MATCH_CAP_FRAC)
+        for label, runner in runners.items():
+            for strat in runner.strategies:
+                strat.update_max_capital(baseline)
+        print_status(f"[REBALANCE] 0 in-play ({len(runners)} dormant) → ${baseline:.2f}/match baseline")
         return
+
     new_alloc = min(bankroll / n, bankroll * PER_MATCH_CAP_FRAC)
-    for label, runner in active.items():
+    for label, runner in in_play.items():
         for strat in runner.strategies:
             strat.update_max_capital(new_alloc)
-    print_status(f"[REBALANCE] {n} active matches → ${new_alloc:.2f}/match (bankroll=${bankroll:.2f}, cap={PER_MATCH_CAP_FRAC:.0%})")
+    # Dormant matches get minimal allocation (can still enter if they wake up)
+    dormant_alloc = min(bankroll / max(1, len(runners)), bankroll * PER_MATCH_CAP_FRAC) * 0.25
+    for label, runner in dormant.items():
+        for strat in runner.strategies:
+            strat.update_max_capital(dormant_alloc)
+    print_status(f"[REBALANCE] {n} in-play → ${new_alloc:.2f}/match, {len(dormant)} dormant → ${dormant_alloc:.2f}/match (bankroll=${bankroll:.2f})")
 
 
 def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
