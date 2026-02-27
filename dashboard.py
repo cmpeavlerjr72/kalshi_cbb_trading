@@ -954,6 +954,34 @@ def compute_open_positions(trades):
     return open_pos
 
 
+def _trim_prematch(snapshots, buffer=50):
+    """Drop prematch snapshots where mid hasn't moved from its initial value.
+    Keeps a small buffer (default 50 rows ~2.5min) before the first movement."""
+    if not snapshots:
+        return snapshots
+    # Find initial mid
+    initial_mid = None
+    for s in snapshots:
+        m = safe_float(s.get("mid"))
+        if m > 0:
+            initial_mid = m
+            break
+    if initial_mid is None:
+        return snapshots
+    # Find first index where mid deviates by >= 1c from initial
+    first_move = None
+    for i, s in enumerate(snapshots):
+        m = safe_float(s.get("mid"))
+        if m > 0 and abs(m - initial_mid) >= 1.0:
+            first_move = i
+            break
+    if first_move is None:
+        return snapshots  # no movement yet — keep everything
+    # Keep buffer rows before the first movement
+    start = max(0, first_move - buffer)
+    return snapshots[start:]
+
+
 def _infer_settlement_from_snapshots(snapshots):
     """Walk snapshots backwards to find the last live mid, then infer winner.
     Returns "yes" or "no", or None if we can't determine."""
@@ -1302,6 +1330,12 @@ def build_dashboard_data(date_str: str):
                 if not trades and not positions and not events:
                     continue
                 ticker_label = game_info["game"]
+
+            # Trim prematch snapshots — prices barely move before match starts,
+            # so hundreds of flat-line rows just waste bandwidth and chart space.
+            # Find the first snapshot where mid deviates from the initial price.
+            if len(snapshots) > 200:
+                snapshots = _trim_prematch(snapshots)
 
             # Downsample large snapshot arrays — keep every Nth row + always keep last
             # Charts/signals work fine with 500-1000 points; no need for 10k+ rows
