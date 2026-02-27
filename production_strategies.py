@@ -1768,6 +1768,7 @@ class GameRunner:
         min_entry_price: int = 0,
         mq_params: Optional[Dict[str, float]] = None,
         base_strategy_overrides: Optional[Dict[str, Dict]] = None,
+        rebalance_fn=None,
     ):
         self.label = game_label
         self.ticker = ticker
@@ -1780,6 +1781,7 @@ class GameRunner:
         self.maker_exits = maker_exits
         self.min_entry_price = min_entry_price
         self._base_strategy_overrides = base_strategy_overrides
+        self._rebalance_fn = rebalance_fn
 
         # P3: Market quality monitor
         mq_kw = mq_params or {}
@@ -2420,6 +2422,12 @@ class GameRunner:
 
                 can_enter, _ = strategy.can_enter(secs_to_close=int(secs_to_close))
                 if can_enter:
+                    # Rebalance capital across active matches right before sizing
+                    if self._rebalance_fn:
+                        try:
+                            self._rebalance_fn()
+                        except Exception:
+                            pass
                     should_enter, side, price, qty, reason = strategy.evaluate_entry(
                         prices, int(secs_to_close), context
                     )

@@ -243,7 +243,8 @@ def find_ml_ticker_from_bundle(bundle: Dict[str, Any], player_code: str, match_k
 def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any],
               bundle: Optional[Dict[str, Any]] = None, uploader=None,
               shared_exposure: Optional["ExposureTracker"] = None,
-              runners: Optional[Dict[str, "GameRunner"]] = None):
+              runners: Optional[Dict[str, "GameRunner"]] = None,
+              bankroll: float = 0.0):
     label = match_config["label"]
     try:
         print_status(f"\n[{label}] Initializing...")
@@ -320,6 +321,11 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
             f"Preferred:{preferred_side.upper()} | Maker entries + MP20"
         )
 
+        # Rebalance callback — called right before every entry sizing
+        rebalance_cb = None
+        if runners is not None and bankroll > 0:
+            rebalance_cb = lambda: _rebalance_allocations(runners, bankroll)
+
         # Run GameRunner (no ESPN clock — tennis uses Kalshi close time only)
         runner = GameRunner(
             game_label=label,
@@ -338,6 +344,7 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
                 "range_min": 3.0,    # smaller range still valid
             },
             base_strategy_overrides={"rolling_avg": TENNIS_RA_OVERRIDES},
+            rebalance_fn=rebalance_cb,
         )
 
         # Register runner for dynamic rebalancing
@@ -430,7 +437,8 @@ def _rebalance_allocations(runners: Dict[str, "GameRunner"], bankroll: float):
     """
     Recompute per-match max_capital based on how many matches are currently IN PLAY.
     A match is "in play" if its market has real price movement (volatility > threshold).
-    Pre-match markets with flat prices get $0 allocation until they start moving.
+    Dormant/prematch markets get $0 — only active matches split the bankroll.
+    Called as a callback right before every entry attempt so sizing is always fresh.
     """
     in_play = {}
     dormant = {}
@@ -443,25 +451,22 @@ def _rebalance_allocations(runners: Dict[str, "GameRunner"], bankroll: float):
 
     n = len(in_play)
     if n == 0:
-        # Nothing in play yet — give everyone a small baseline so they can
-        # enter if a match suddenly starts
+        # Nothing in play yet — give everyone a small baseline so the first
+        # match to start can enter
         baseline = min(bankroll / max(1, len(runners)), bankroll * PER_MATCH_CAP_FRAC)
         for label, runner in runners.items():
             for strat in runner.strategies:
                 strat.update_max_capital(baseline)
-        print_status(f"[REBALANCE] 0 in-play ({len(runners)} dormant) → ${baseline:.2f}/match baseline")
         return
 
     new_alloc = min(bankroll / n, bankroll * PER_MATCH_CAP_FRAC)
     for label, runner in in_play.items():
         for strat in runner.strategies:
             strat.update_max_capital(new_alloc)
-    # Dormant matches get minimal allocation (can still enter if they wake up)
-    dormant_alloc = min(bankroll / max(1, len(runners)), bankroll * PER_MATCH_CAP_FRAC) * 0.25
+    # Dormant matches get $0 — they aren't playing, don't reserve capital
     for label, runner in dormant.items():
         for strat in runner.strategies:
-            strat.update_max_capital(dormant_alloc)
-    print_status(f"[REBALANCE] {n} in-play → ${new_alloc:.2f}/match, {len(dormant)} dormant → ${dormant_alloc:.2f}/match (bankroll=${bankroll:.2f})")
+            strat.update_max_capital(0)
 
 
 def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
@@ -514,7 +519,7 @@ def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
                     t = threading.Thread(
                         target=run_match,
                         args=(m, match_pk, results, bundle, uploader,
-                              shared_exposure, runners),
+                              shared_exposure, runners, bankroll),
                         name=m.get("label", mk),
                         daemon=False,
                     )
@@ -711,7 +716,7 @@ def main() -> int:
         t = threading.Thread(
             target=run_match,
             args=(match, match_pk, results, bundle, uploader,
-                  global_exposure, runners),
+                  global_exposure, runners, bankroll),
             name=match["label"],
             daemon=False,
         )

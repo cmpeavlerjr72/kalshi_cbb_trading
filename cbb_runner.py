@@ -95,6 +95,37 @@ GAMES = [
     # {"label": "Duke at UNC", "team_name": "DUKE", "espn_date": "20260225", "espn_team": "DUKE", "espn_opponent": "UNC", "model_p_win": 0.55},
 ]
 
+PER_GAME_CAP_FRAC = float(os.getenv("GAME_CAP_FRAC", "0.50"))
+MIN_VOL_FOR_ACTIVE = 0.5  # min std of recent mids to count as "in play"
+
+
+def _rebalance_allocations(runners: Dict[str, "GameRunner"], bankroll: float):
+    """Recompute per-game max_capital. Only in-play games split the bankroll."""
+    in_play = {}
+    dormant = {}
+    for label, r in runners.items():
+        vol = r.quality.recent_volatility() if hasattr(r, 'quality') else 0.0
+        if vol >= MIN_VOL_FOR_ACTIVE:
+            in_play[label] = r
+        else:
+            dormant[label] = r
+
+    n = len(in_play)
+    if n == 0:
+        baseline = min(bankroll / max(1, len(runners)), bankroll * PER_GAME_CAP_FRAC)
+        for label, runner in runners.items():
+            for strat in runner.strategies:
+                strat.update_max_capital(baseline)
+        return
+
+    new_alloc = min(bankroll / n, bankroll * PER_GAME_CAP_FRAC)
+    for label, runner in in_play.items():
+        for strat in runner.strategies:
+            strat.update_max_capital(new_alloc)
+    for label, runner in dormant.items():
+        for strat in runner.strategies:
+            strat.update_max_capital(0)
+
 
 # ============================================================================
 # LOG DIRECTORY
@@ -258,7 +289,9 @@ def setup_espn_clock(game_config: Dict[str, Any]) -> Optional[EspnGameClock]:
 # ============================================================================
 
 def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any],
-             bundle: Optional[Dict[str, Any]] = None, uploader=None):
+             bundle: Optional[Dict[str, Any]] = None, uploader=None,
+             runners: Optional[Dict[str, "GameRunner"]] = None,
+             bankroll: float = 0.0):
     label = game_config["label"]
     try:
         print_status(f"\n[{label}] Initializing...")
@@ -336,6 +369,11 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any],
             f"ESPN:{'ON' if espn_clock else 'OFF'}"
         )
 
+        # Rebalance callback — called right before every entry sizing
+        rebalance_cb = None
+        if runners is not None and bankroll > 0:
+            rebalance_cb = lambda: _rebalance_allocations(runners, bankroll)
+
         # Run GameRunner (with ESPN clock for CBB)
         runner = GameRunner(
             game_label=label,
@@ -354,7 +392,12 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any],
                 "range_min": 3.0,
             },
             base_strategy_overrides={"rolling_avg": CBB_RA_OVERRIDES},
+            rebalance_fn=rebalance_cb,
         )
+
+        # Register runner for dynamic rebalancing
+        if runners is not None:
+            runners[label] = runner
 
         summary = runner.run()
         results[label] = summary
@@ -445,7 +488,9 @@ def game_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
                       results: Dict[str, Any], threads: List[threading.Thread],
                       private_key_path: str, bundle: Optional[Dict[str, Any]],
                       cloud_mode: bool, balance_per_game: float,
-                      stop_event: Optional[Any] = None, uploader=None):
+                      stop_event: Optional[Any] = None, uploader=None,
+                      runners: Optional[Dict[str, "GameRunner"]] = None,
+                      bankroll: float = 0.0):
     """
     Periodically re-reads cbb_games.json and launches threads for new games.
     Runs as a daemon thread.
@@ -483,7 +528,7 @@ def game_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
 
                     t = threading.Thread(
                         target=run_game,
-                        args=(g, game_pk, results, bundle, uploader),
+                        args=(g, game_pk, results, bundle, uploader, runners, bankroll),
                         name=g.get("label", gk),
                         daemon=False,
                     )
@@ -690,6 +735,8 @@ def main() -> int:
     # --- Launch game threads ---
     results: Dict[str, Any] = {}
     threads: List[threading.Thread] = []
+    runners: Dict[str, GameRunner] = {}
+    bankroll = balance
 
     key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip()
 
@@ -704,7 +751,7 @@ def main() -> int:
         game_pk = _load_private_key(key_path)
         t = threading.Thread(
             target=run_game,
-            args=(game, game_pk, results, bundle, uploader),
+            args=(game, game_pk, results, bundle, uploader, runners, bankroll),
             name=game["label"],
             daemon=False,
         )
@@ -716,7 +763,8 @@ def main() -> int:
     watcher_thread = threading.Thread(
         target=game_watcher_loop,
         args=(running_keys, running_keys_lock, results, threads,
-              key_path, bundle, cloud_mode, per_game_allocation, stop, uploader),
+              key_path, bundle, cloud_mode, per_game_allocation, stop, uploader,
+              runners, bankroll),
         name="game_watcher",
         daemon=True,
     )
