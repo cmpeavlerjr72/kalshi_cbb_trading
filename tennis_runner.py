@@ -106,6 +106,32 @@ MATCHES = [
 
 LOG_ROOT = Path(os.getenv("KALSHI_LOG_ROOT", "kalshi-logs"))
 
+# Month abbreviation → number mapping for match key date parsing
+_MONTH_MAP = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+    "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+    "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+}
+
+
+def date_from_match_key(match_key: Optional[str]) -> Optional[str]:
+    """
+    Extract YYYY-MM-DD from a Kalshi match key like '26FEB27AUGMED'.
+    Format: <YY><MON><DD><player codes...>  →  20YY-MM-DD
+    Returns None if parsing fails.
+    """
+    if not match_key or len(match_key) < 7:
+        return None
+    try:
+        yy = match_key[:2]
+        mon = match_key[2:5].upper()
+        dd = match_key[5:7]
+        if mon not in _MONTH_MAP or not yy.isdigit() or not dd.isdigit():
+            return None
+        return f"20{yy}-{_MONTH_MAP[mon]}-{dd}"
+    except Exception:
+        return None
+
 
 def safe_name(s: str) -> str:
     s = s.strip().replace(" ", "_")
@@ -243,8 +269,11 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
         # Use global shared exposure tracker if provided, else per-match fallback
         exposure = shared_exposure if shared_exposure else ExposureTracker(max_exposure_dollars=allocation)
 
-        # Log directory — derive series from ticker for correct subfolder
-        match_date = utc_now().strftime("%Y-%m-%d")
+        # Log directory — derive date from match key, fall back to Eastern time
+        match_date = date_from_match_key(match_key)
+        if not match_date:
+            eastern_offset = dt.timezone(dt.timedelta(hours=-5))
+            match_date = dt.datetime.now(eastern_offset).strftime("%Y-%m-%d")
         ticker_series = ml_ticker.split("-")[0] if ml_ticker else (series_override or "KXATPMATCH")
         log_dir = build_match_log_dir(label, match_date, series=ticker_series)
         log_dir.mkdir(parents=True, exist_ok=True)

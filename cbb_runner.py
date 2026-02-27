@@ -102,6 +102,32 @@ GAMES = [
 
 LOG_ROOT = Path(os.getenv("KALSHI_LOG_ROOT", "kalshi-logs"))
 
+# Month abbreviation → number mapping for game key date parsing
+_MONTH_MAP = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+    "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+    "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+}
+
+
+def date_from_game_key(game_key: Optional[str]) -> Optional[str]:
+    """
+    Extract YYYY-MM-DD from a Kalshi game key like '26FEB25MERWCU'.
+    Format: <YY><MON><DD><team codes...>  →  20YY-MM-DD
+    Returns None if parsing fails.
+    """
+    if not game_key or len(game_key) < 7:
+        return None
+    try:
+        yy = game_key[:2]
+        mon = game_key[2:5].upper()
+        dd = game_key[5:7]
+        if mon not in _MONTH_MAP or not yy.isdigit() or not dd.isdigit():
+            return None
+        return f"20{yy}-{_MONTH_MAP[mon]}-{dd}"
+    except Exception:
+        return None
+
 
 def safe_name(s: str) -> str:
     s = s.strip().replace(" ", "_")
@@ -260,10 +286,11 @@ def run_game(game_config: Dict[str, Any], private_key, results: Dict[str, Any],
         # Shared exposure tracker for this game
         exposure = ExposureTracker(max_exposure_dollars=allocation)
 
-        # Log directory
-        # Use Eastern time for date so evening games don't roll to next day
-        eastern_offset = dt.timezone(dt.timedelta(hours=-5))
-        game_date = dt.datetime.now(eastern_offset).strftime("%Y-%m-%d")
+        # Log directory — derive date from game key, fall back to Eastern time
+        game_date = date_from_game_key(game_key)
+        if not game_date:
+            eastern_offset = dt.timezone(dt.timedelta(hours=-5))
+            game_date = dt.datetime.now(eastern_offset).strftime("%Y-%m-%d")
         log_dir = build_game_log_dir(label, game_date)
         log_dir.mkdir(parents=True, exist_ok=True)
 
