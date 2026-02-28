@@ -49,6 +49,7 @@ from combo_vnext import (
 
 from production_strategies import (
     RollingAverageStrategy,
+    DipBuyerStrategy,
     ExposureTracker,
     GameRunner,
 )
@@ -67,22 +68,25 @@ TENNIS_SERIES = ["KXATPMATCH", "KXATPCHALLENGERMATCH", "KXWTAMATCH"]
 
 MATCHES_JSON_FILE = REPO_ROOT / "tennis_matches.json"
 
-# Tennis-optimal RA params from grid search (EMA/TMA 40/160 t=12)
-TENNIS_RA_OVERRIDES = {
-    "strategy_type": "ema_tma",
-    "fast_window": 40,
-    "slow_window": 160,
-    "threshold_cents": 12,
-    "spread_max": 6,
+# Tennis dip buyer params from 103-match backtest ($4.15/match, 69% WR)
+TENNIS_DIP_OVERRIDES = {
+    "dip_cents": 20,
+    "stabilize_ticks": 5,
+    "lookback": 40,
+    "take_profit": 8,
+    "stop_loss": 15,
+    "spread_max": 4,
+    "min_price": 15,
+    "max_price": 85,
     "max_positions": 1,
     "entry_frac": 0.50,
     "min_qty": 3,
     "max_order_qty": 200,
-    "profit_defense_activate_cents": 8.0,
+    "min_entry_gap_secs": 45,
+    "flatten_before_close_secs": 120,
+    "profit_defense_activate_cents": 6.0,
     "profit_defense_giveback_frac": 0.40,
     "profit_defense_min_keep_cents": 2.0,
-    "flatten_before_close_secs": 120,
-    "directional_close_secs": 300,
 }
 
 # Today's matches — fallback if tennis_matches.json not found
@@ -295,30 +299,30 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
         except Exception as e:
             print_status(f"[{label}] Warning: failed to load strategy_config.json: {e}")
 
-        # Strategy: RA-only (Rolling Average / MA crossover)
-        # 100% allocation to RA — no MR for this test run
+        # Strategy: Dip Buyer (mean-reversion for tennis)
         strategies = [
-            RollingAverageStrategy(
+            DipBuyerStrategy(
                 max_capital=allocation,
                 preferred_side=preferred_side,
                 exposure_tracker=exposure,
             ),
         ]
 
-        # Apply tennis RA defaults, then strategy_config.json overrides on top
+        # Apply tennis dip buyer defaults, then strategy_config.json overrides on top
         for strat in strategies:
-            strat.update_params(TENNIS_RA_OVERRIDES)
+            strat.update_params(TENNIS_DIP_OVERRIDES)
             overrides = strategy_config_overrides.get(strat.name, {})
             if overrides:
                 strat.update_params(overrides)
 
-        st = strat.params.get("strategy_type", "ema_tma")
-        fw = strat.params.get("fast_window", 40)
-        sw = strat.params.get("slow_window", 160)
-        tc = strat.params.get("threshold_cents", 12)
+        dc = strat.params.get("dip_cents", 20)
+        st_ticks = strat.params.get("stabilize_ticks", 5)
+        lb = strat.params.get("lookback", 40)
+        tp = strat.params.get("take_profit", 8)
+        sl = strat.params.get("stop_loss", 15)
         print_status(
-            f"[{label}] RA:{st} {fw}/{sw} t={tc} | ${allocation:.2f} | "
-            f"Preferred:{preferred_side.upper()} | Maker entries + MP20"
+            f"[{label}] DipBuyer: dip={dc}c stab={st_ticks} lb={lb} tp={tp} sl={sl} | "
+            f"${allocation:.2f} | Maker entries"
         )
 
         # Rebalance callback — called right before every entry sizing
@@ -343,7 +347,7 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
                 "spread_max": 10.0,  # tennis books are naturally thinner
                 "range_min": 3.0,    # smaller range still valid
             },
-            base_strategy_overrides={"rolling_avg": TENNIS_RA_OVERRIDES},
+            base_strategy_overrides={"dip_buyer": TENNIS_DIP_OVERRIDES},
             rebalance_fn=rebalance_cb,
         )
 

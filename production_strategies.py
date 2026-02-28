@@ -1630,6 +1630,217 @@ class RollingAverageStrategy(BaseStrategy):
 
 
 # =============================================================================
+# STRATEGY: DIP BUYER (mean-reversion dip buying for tennis)
+# =============================================================================
+
+class DipBuyerStrategy(BaseStrategy):
+    """
+    Mean-reversion dip buyer: buys when price drops N cents from rolling high
+    and stabilizes. Optimized for tennis markets which exhibit strong
+    mean-reverting behavior (negative autocorrelation at all timeframes).
+
+    Entry: price must drop `dip_cents` from rolling high over `lookback` window,
+           then show `stabilize_ticks` of no new low (stabilization).
+    Exit:  take-profit, stop-loss, profit defense trailing stop, near-close flatten.
+
+    Best config from 103-match backtest: $4.15/match, 69% WR, $427 total.
+    """
+
+    bypass_market_quality = True  # does its own spread gating
+
+    def __init__(self, max_capital: float, preferred_side: Optional[str] = None,
+                 exposure_tracker: Optional["ExposureTracker"] = None):
+        params = {
+            "dip_cents": 20,
+            "stabilize_ticks": 5,
+            "lookback": 40,
+            "take_profit": 8,
+            "stop_loss": 15,
+            "spread_max": 4,
+            "min_price": 15,
+            "max_price": 85,
+            "max_positions": 1,
+            "entry_frac": 0.50,
+            "min_qty": 3,
+            "max_order_qty": 200,
+            "min_entry_gap_secs": 45,
+            "stop_trading_before_close_secs": 0,
+            "side_cooldown_secs": 0,
+            "flatten_before_close_secs": 120,
+            "profit_defense_activate_cents": 6.0,
+            "profit_defense_giveback_frac": 0.40,
+            "profit_defense_min_keep_cents": 2.0,
+        }
+        super().__init__("dip_buyer", max_capital, params)
+
+        self.exposure_tracker = exposure_tracker
+        self.preferred_side = None
+        if preferred_side is not None:
+            ps = preferred_side.lower().strip()
+            if ps in ("yes", "no"):
+                self.preferred_side = ps
+
+        # Rolling window of mid prices
+        self._mids: deque = deque(maxlen=params["lookback"])
+        self._tick = 0
+
+        # Dip detection state
+        self._dip_ready = False
+        self._ticks_since_low = 0
+        self._recent_low: Optional[float] = None
+
+    def feed_price(self, mid: float):
+        """Called every tick (~3s). Tracks rolling high and stabilization."""
+        self._tick += 1
+        self._mids.append(mid)
+
+        lookback = int(self.params.get("lookback", 40))
+        stabilize = int(self.params.get("stabilize_ticks", 5))
+        dip_cents = float(self.params.get("dip_cents", 20))
+
+        if len(self._mids) < stabilize + 1:
+            self._dip_ready = False
+            return
+
+        # Rolling high excluding the last `stabilize_ticks` prices
+        # (we want the high to be from before the stabilization window)
+        window = list(self._mids)
+        history = window[:-stabilize] if len(window) > stabilize else window
+        if not history:
+            self._dip_ready = False
+            return
+
+        rolling_high = max(history)
+        current_low = min(window[-stabilize:])
+
+        # Track whether we're making new lows
+        if self._recent_low is None or current_low < self._recent_low:
+            self._recent_low = current_low
+            self._ticks_since_low = 0
+        else:
+            self._ticks_since_low += 1
+
+        # Dip condition: dropped enough from rolling high AND stabilized
+        drop = rolling_high - mid
+        if drop >= dip_cents and self._ticks_since_low >= stabilize:
+            self._dip_ready = True
+        else:
+            self._dip_ready = False
+
+    def evaluate_entry(self, prices, secs_to_close, context) -> Tuple[bool, str, int, int, str]:
+        if not self._dip_ready:
+            return False, "", 0, 0, "no_dip"
+
+        yes_ask = prices.get("imp_yes_ask")
+        yes_bid = prices.get("best_yes_bid")
+
+        if yes_ask is None or yes_bid is None:
+            return False, "", 0, 0, "no_prices"
+
+        mid = (int(yes_ask) + int(yes_bid)) / 2.0
+
+        # Price range filter
+        min_price = int(self.params.get("min_price", 15))
+        max_price = int(self.params.get("max_price", 85))
+        if mid < min_price or mid > max_price:
+            return False, "", 0, 0, f"price_range:{mid:.0f}"
+
+        # Spread filter
+        spread = int(yes_ask) - int(yes_bid)
+        spread_max = int(self.params.get("spread_max", 4))
+        if spread > spread_max:
+            return False, "", 0, 0, f"spread:{spread}>{spread_max}"
+
+        # Near-close lockout (use flatten window as lockout for new entries)
+        flatten_secs = int(self.params.get("flatten_before_close_secs", 120))
+        if secs_to_close <= flatten_secs:
+            return False, "", 0, 0, f"near_close:{int(secs_to_close)}s"
+
+        # Always buy YES side (dip buyer buys the dip)
+        entry_price = int(yes_ask)
+
+        # Size qty
+        remaining = max(0.0, float(self.max_capital) - float(self.capital_used))
+        per = entry_price / 100.0
+        if per <= 0:
+            return False, "", 0, 0, "no_capital"
+        max_possible = int(remaining / per)
+
+        entry_frac = float(self.params.get("entry_frac", 0.50))
+        min_qty = int(self.params.get("min_qty", 3))
+        max_qty = int(self.params.get("max_order_qty", 200))
+
+        qty = max(int(max_possible * entry_frac), min(min_qty, max_possible))
+        qty = min(qty, max_qty, max_possible)
+        if qty <= 0:
+            return False, "", 0, 0, "no_capital"
+
+        # Check exposure tracker
+        if self.exposure_tracker:
+            cost = entry_price * qty / 100.0
+            if not self.exposure_tracker.try_reserve(cost):
+                return False, "", 0, 0, "exposure_limit"
+
+        # Consume the signal
+        self._dip_ready = False
+        self._recent_low = None
+        self._ticks_since_low = 0
+
+        return True, "yes", entry_price, qty, \
+            f"dip_buy:drop={self.params['dip_cents']}c,mid={mid:.0f},spread={spread},tick={self._tick}"
+
+    def evaluate_exit(self, position, prices, secs_to_close, context) -> Tuple[bool, str, int, str]:
+        yes_bid = prices.get("best_yes_bid")
+        if yes_bid is None:
+            return False, "", 0, "no_bid"
+
+        yes_bid_i = int(yes_bid)
+
+        # 1. Near-close flatten
+        flatten_secs = int(self.params.get("flatten_before_close_secs", 120))
+        if secs_to_close <= flatten_secs:
+            return True, "timeout", max(1, yes_bid_i - 1), \
+                f"near_close_flatten:{int(secs_to_close)}s"
+
+        pnl = float(yes_bid) - float(position.entry_price)
+
+        # 2. Take profit
+        tp = float(self.params.get("take_profit", 8))
+        if pnl >= tp:
+            return True, "take_profit", max(1, yes_bid_i - 1), \
+                f"take_profit:pnl={pnl:.0f}c>={tp:.0f}c"
+
+        # 3. Stop loss
+        sl = float(self.params.get("stop_loss", 15))
+        if pnl <= -sl:
+            return True, "stop_loss", max(1, yes_bid_i - 1), \
+                f"stop_loss:pnl={pnl:.0f}c<=-{sl:.0f}c"
+
+        # 4. Profit defense (trailing stop)
+        activate = float(self.params.get("profit_defense_activate_cents", 6.0))
+        giveback_frac = float(self.params.get("profit_defense_giveback_frac", 0.40))
+        min_keep = float(self.params.get("profit_defense_min_keep_cents", 2.0))
+
+        if pnl > position.max_fav_pnl_cents:
+            position.max_fav_pnl_cents = pnl
+            position.max_fav_ts = utc_now().isoformat()
+        if position.max_fav_pnl_cents >= activate:
+            floor = position.max_fav_pnl_cents * (1.0 - giveback_frac)
+            if pnl <= max(min_keep, floor):
+                return True, "profit_defense", max(1, yes_bid_i - 1), \
+                    f"profit_defense:pnl={pnl:.0f}c peak={position.max_fav_pnl_cents:.0f}c floor={floor:.0f}c"
+
+        return False, "", 0, "hold"
+
+    def update_params(self, overrides: dict):
+        """Override to rebuild deque maxlen if lookback changed."""
+        super().update_params(overrides)
+        if "lookback" in overrides:
+            old = list(self._mids)
+            self._mids = deque(old, maxlen=int(self.params["lookback"]))
+
+
+# =============================================================================
 # STRATEGY: FINAL MINUTES (near-guaranteed late-game trades)
 # =============================================================================
 
