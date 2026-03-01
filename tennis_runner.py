@@ -247,8 +247,7 @@ def find_ml_ticker_from_bundle(bundle: Dict[str, Any], player_code: str, match_k
 def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any],
               bundle: Optional[Dict[str, Any]] = None, uploader=None,
               shared_exposure: Optional["ExposureTracker"] = None,
-              runners: Optional[Dict[str, "GameRunner"]] = None,
-              bankroll: float = 0.0):
+              runners: Optional[Dict[str, "GameRunner"]] = None):
     label = match_config["label"]
     try:
         print_status(f"\n[{label}] Initializing...")
@@ -326,9 +325,10 @@ def run_match(match_config: Dict[str, Any], private_key, results: Dict[str, Any]
         )
 
         # Rebalance callback — called right before every entry sizing
+        # Fetches live balance from Kalshi API (cached 30s)
         rebalance_cb = None
-        if runners is not None and bankroll > 0:
-            rebalance_cb = lambda: _rebalance_allocations(runners, bankroll)
+        if runners is not None:
+            rebalance_cb = lambda: _rebalance_allocations(runners, private_key)
 
         # Run GameRunner (no ESPN clock — tennis uses Kalshi close time only)
         runner = GameRunner(
@@ -437,13 +437,43 @@ def load_matches_from_file() -> Optional[List[Dict[str, Any]]]:
 MIN_VOL_FOR_ACTIVE = 0.5  # min std of recent mids to count as "in play"
 
 
-def _rebalance_allocations(runners: Dict[str, "GameRunner"], bankroll: float):
+# Live bankroll cache — shared across threads, refreshed every 30s
+_bankroll_cache = {"value": 0.0, "ts": 0.0, "lock": threading.Lock()}
+_BANKROLL_REFRESH_SECS = 30
+
+
+def _fetch_live_bankroll(private_key) -> float:
+    """Fetch current Kalshi balance, cached for 30s to avoid API spam."""
+    now = time.time()
+    with _bankroll_cache["lock"]:
+        if now - _bankroll_cache["ts"] < _BANKROLL_REFRESH_SECS and _bankroll_cache["value"] > 0:
+            return _bankroll_cache["value"]
+    # Fetch outside lock to avoid blocking other threads
+    try:
+        resp = _get(private_key, "/trade-api/v2/portfolio/balance")
+        balance = int(resp.get("balance", 0)) / 100.0
+        with _bankroll_cache["lock"]:
+            _bankroll_cache["value"] = balance
+            _bankroll_cache["ts"] = now
+        return balance
+    except Exception as e:
+        print_status(f"[REBALANCE] Balance fetch failed: {e}")
+        with _bankroll_cache["lock"]:
+            return _bankroll_cache["value"]  # return stale value on error
+
+
+def _rebalance_allocations(runners: Dict[str, "GameRunner"], private_key):
     """
     Recompute per-match max_capital based on how many matches are currently IN PLAY.
     A match is "in play" if its market has real price movement (volatility > threshold).
     Dormant/prematch markets get $0 — only active matches split the bankroll.
     Called as a callback right before every entry attempt so sizing is always fresh.
+    Fetches live balance from Kalshi API (cached 30s).
     """
+    bankroll = _fetch_live_bankroll(private_key)
+    if bankroll <= 0:
+        return
+
     in_play = {}
     dormant = {}
     for label, r in runners.items():
@@ -479,8 +509,7 @@ def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
                        cloud_mode: bool, balance_per_match: float,
                        stop_event: Optional[Any] = None, uploader=None,
                        shared_exposure: Optional["ExposureTracker"] = None,
-                       runners: Optional[Dict[str, "GameRunner"]] = None,
-                       bankroll: float = 0.0):
+                       runners: Optional[Dict[str, "GameRunner"]] = None):
     """
     Periodically re-reads tennis_matches.json and launches threads for new matches.
     Also rebalances capital allocations across active matches every cycle.
@@ -493,9 +522,10 @@ def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
         time.sleep(check_interval)
 
         try:
-            # Rebalance allocations across active matches
-            if runners is not None and bankroll > 0:
-                _rebalance_allocations(runners, bankroll)
+            # Rebalance allocations across active matches (fetches live balance)
+            watcher_pk = _load_private_key(private_key_path)
+            if runners is not None:
+                _rebalance_allocations(runners, watcher_pk)
 
             new_matches = load_matches_from_file()
             if not new_matches:
@@ -509,9 +539,10 @@ def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
 
                     # New match found — launch thread
                     running_keys.add(mk)
-                    # Compute allocation based on current active count + 1
+                    # Compute allocation based on live balance
+                    live_bankroll = _fetch_live_bankroll(watcher_pk)
                     active_after = len(runners) + 1 if runners else 1
-                    new_alloc = min(bankroll / active_after, bankroll * PER_MATCH_CAP_FRAC) if bankroll > 0 else balance_per_match
+                    new_alloc = min(live_bankroll / active_after, live_bankroll * PER_MATCH_CAP_FRAC) if live_bankroll > 0 else balance_per_match
                     m["allocation"] = float(m.get("allocation") or new_alloc)
 
                     try:
@@ -523,7 +554,7 @@ def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
                     t = threading.Thread(
                         target=run_match,
                         args=(m, match_pk, results, bundle, uploader,
-                              shared_exposure, runners, bankroll),
+                              shared_exposure, runners),
                         name=m.get("label", mk),
                         daemon=False,
                     )
@@ -532,8 +563,8 @@ def match_watcher_loop(running_keys: set, running_keys_lock: threading.Lock,
                     print_status(f"[WATCHER] Hot-added: {m.get('label', mk)} (alloc=${m['allocation']:.2f})")
 
                     # Rebalance existing matches to account for the new one
-                    if runners is not None and bankroll > 0:
-                        _rebalance_allocations(runners, bankroll)
+                    if runners is not None:
+                        _rebalance_allocations(runners, watcher_pk)
 
         except Exception as e:
             print_status(f"[WATCHER] Error: {e}")
@@ -640,11 +671,9 @@ def main() -> int:
         print_status("No matches configured!")
         return 1
 
-    # Balance check + allocation
+    # Balance check + allocation (seeds the live bankroll cache)
     try:
-        resp = _get(private_key, "/trade-api/v2/portfolio/balance")
-        balance_cents = int(resp.get("balance", 0))
-        bankroll = balance_cents / 100.0
+        bankroll = _fetch_live_bankroll(private_key)
         print_status(f"Balance: ${bankroll:.2f}")
 
         # Global shared exposure tracker — prevents total portfolio overspend
@@ -720,7 +749,7 @@ def main() -> int:
         t = threading.Thread(
             target=run_match,
             args=(match, match_pk, results, bundle, uploader,
-                  global_exposure, runners, bankroll),
+                  global_exposure, runners),
             name=match["label"],
             daemon=False,
         )
@@ -733,7 +762,7 @@ def main() -> int:
         target=match_watcher_loop,
         args=(running_keys, running_keys_lock, results, threads,
               key_path, bundle, cloud_mode, per_match_allocation, stop, uploader,
-              global_exposure, runners, bankroll),
+              global_exposure, runners),
         name="match_watcher",
         daemon=True,
     )
