@@ -51,5 +51,117 @@
     "opponent_code": "TIA",
     "match_key": "26FEB28COBTIA",
     "model_p_win": 0.5
+  },
+  {
+    "label": "Gadamauri vs Mansilla Diez",
+    "player_code": "GAD",
+    "opponent_code": "MAN",
+    "match_key": "26MAR01GADMAN",
+    "series": "KXATPCHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Schinas vs Carboni",
+    "player_code": "SCH",
+    "opponent_code": "CAR",
+    "match_key": "26MAR01SCHCAR",
+    "series": "KXATPCHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Pieri vs Konovchuk",
+    "player_code": "PIE",
+    "opponent_code": "KON",
+    "match_key": "26MAR01PIEKON",
+    "series": "KXATPCHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Vasa vs Alvarado",
+    "player_code": "VAS",
+    "opponent_code": "ALV",
+    "match_key": "26MAR01VASALV",
+    "series": "KXATPCHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Sakellaridis vs Loge",
+    "player_code": "SAK",
+    "opponent_code": "LOG",
+    "match_key": "26MAR01SAKLOG",
+    "series": "KXATPCHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Cina vs Gill",
+    "player_code": "CIN",
+    "opponent_code": "GIL",
+    "match_key": "26MAR01CINGIL",
+    "series": "KXATPCHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Uchijima vs Kalinina",
+    "player_code": "UCH",
+    "opponent_code": "KAL",
+    "match_key": "26MAR01UCHKAL",
+    "series": "KXWTACHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Barranco Cosano vs Makk",
+    "player_code": "BAR",
+    "opponent_code": "MAK",
+    "match_key": "26MAR01BARMAK",
+    "series": "KXATPCHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Ristic vs Hontama",
+    "player_code": "RIS",
+    "opponent_code": "HON",
+    "match_key": "26MAR01RISHON",
+    "series": "KXWTACHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Ibragimova vs Pigossi",
+    "player_code": "IBR",
+    "opponent_code": "PIG",
+    "match_key": "26MAR01IBRPIG",
+    "series": "KXWTACHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Zolotareva vs Toth",
+    "player_code": "ZOL",
+    "opponent_code": "TOT",
+    "match_key": "26MAR01ZOLTOT",
+    "series": "KXWTACHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Ovcharenko vs Fellin",
+    "player_code": "OVC",
+    "opponent_code": "FEL",
+    "match_key": "26MAR01OVCFEL",
+    "series": "KXATPCHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Pigato vs Sobolieva",
+    "player_code": "PIG",
+    "opponent_code": "SOB",
+    "match_key": "26MAR01PIGSOB",
+    "series": "KXWTACHALLENGERMATCH",
+    "model_p_win": 0.5
+  },
+  {
+    "label": "Soriano Barrera vs Bernet",
+    "player_code": "SOR",
+    "opponent_code": "BER",
+    "match_key": "26MAR01SORBER",
+    "series": "KXATPCHALLENGERMATCH",
+    "model_p_win": 0.5
   }
 ]
